@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════╗
-║     法律问答助手 v4.0 — 全量法律库 + DeepSeek AI     ║
+║   法律问答助手 v4.5 — 全量法律库 + AI + 案例搜索     ║
 ║                                                      ║
-║  内置法律库：1661部法律法规 + 两高司法解释            ║
+║  内置法律库：4868部法律法规 + 司法解释 + 典型案例     ║
 ║  AI 引擎：  DeepSeek 大模型智能回答                   ║
+║  特色功能：联网搜索 · 两高典型案例检索                ║
 ║  部署平台：Railway.com                                ║
 ╚══════════════════════════════════════════════════════╝
 """
@@ -116,6 +117,50 @@ def web_search(question, max_results=6):
         results = results[:max_results]
     except Exception as e:
         print(f'[联网搜索] 失败: {e}')
+        return []
+    return results
+
+
+def case_search(question, max_results=8):
+    """专门搜索两高典型案例，优先从官方案例库和权威来源获取"""
+    if not WEB_SEARCH_AVAILABLE:
+        return []
+    results = []
+    try:
+        # 案例专用搜索词：加上典型案例/指导性案例限定
+        query = f'{question} 典型案例 最高人民法院 最高人民检察院'
+        try:
+            raw = list(DDGS().text(query, region='cn-zh', max_results=20))
+        except TypeError:
+            raw = list(DDGS().text(query, max_results=20))
+        # 案例来源优先级
+        case_domains = [
+            'court.gov.cn', 'spp.gov.cn', 'rmfyalk.court.gov.cn',
+            'wenshu.court.gov.cn', 'pkulaw.com', 'chinalawinfo.com',
+        ]
+        case_kws = ['典型案例', '指导性案例', '案例', '判决', '裁定', '公诉', '审判']
+        for item in raw:
+            url = item.get('href', '') or item.get('url', '') or item.get('link', '')
+            title = (item.get('title', '') or '').strip()
+            body = (item.get('body', '') or item.get('snippet', '') or item.get('content', '') or '').strip()
+            if not title or not body:
+                continue
+            if any(j in url for j in JUNK_DOMAINS):
+                continue
+            is_case_source = any(d in url for d in case_domains)
+            is_case_related = any(k in title or k in body for k in case_kws)
+            if not (is_case_source or is_case_related):
+                continue
+            results.append({
+                'title': title,
+                'body': body[:500],
+                'url': url,
+                'trusted': is_case_source,
+            })
+        results.sort(key=lambda x: not x['trusted'])
+        results = results[:max_results]
+    except Exception as e:
+        print(f'[案例搜索] 失败: {e}')
         return []
     return results
 
@@ -383,20 +428,94 @@ class LegalDocManager:
             display_parts.append(f"【{chunk['title']}】（{src_display}）\n{display}")
         return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
-    def _call_deepseek(self, question, context, history=None, has_web=False):
-        """调用 DeepSeek API（支持多轮对话上下文和联网搜索）"""
-        system_prompt = (
-            '你是一位专业的中国法律顾问，名叫"法小智"。你拥有涵盖宪法、民法典、刑法、行政法、经济法、'
-            '社会法、诉讼法、司法解释等1600余部法律法规的完整知识库。请根据提供的法律条文回答用户的问题。\n\n'
-            '回答要求：\n'
-            '1. 准确引用具体法条（如"根据《民法典》第577条"）\n'
-            '2. 用通俗易懂的语言解释法律含义\n'
-            '3. 如果涉及多个法条，分点说明\n'
-            '4. 如果提供的法条不足以完整回答，请如实说明并给出一般性法律建议\n'
-            '5. 回答末尾提醒用户：具体案件建议咨询专业律师\n'
-            '6. 不要编造不存在的法条\n'
-            '7. 结合之前的对话上下文理解用户的追问，保持回答连贯'
-        )
+    def answer_with_cases(self, question, history=None):
+        """案例搜索模式：搜索库内典型案例 + 联网搜索两高案例 + AI分析"""
+        # 1. 在本地库中搜索案例相关内容
+        local_results = self.search(question, top_n=6)
+        # 优先筛选分类含"案例"的结果
+        case_results = [c for c in local_results if '案例' in c['source']]
+        other_results = [c for c in local_results if '案例' not in c['source']]
+        local_case = (case_results + other_results)[:6]
+
+        # 2. 联网搜索两高典型案例
+        web_cases = case_search(question)
+
+        if not local_case and not web_cases:
+            if DEEPSEEK_API_KEY:
+                ai_answer = self._call_deepseek(question, '', history, case_mode=True)
+                if ai_answer:
+                    return {'answer': ai_answer, 'citations': [], 'web_citations': [], 'ai_used': True}
+            return {'answer': '抱歉，未找到相关典型案例。建议换一种方式提问，或前往人民法院案例库（rmfyalk.court.gov.cn）直接检索。',
+                    'citations': [], 'web_citations': [], 'ai_used': False}
+
+        # 3. 构建上下文
+        context_parts = []
+        citations = []
+        if local_case:
+            context_parts.append('=== 库内相关案例/法条 ===')
+            for chunk in local_case:
+                src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
+                context_parts.append(f"【{chunk['title']}】（{src_display}）\n{chunk['content']}")
+                citations.append({'title': chunk['title'], 'source': src_display})
+
+        web_citations = []
+        if web_cases:
+            context_parts.append('=== 联网搜索到的两高典型案例（已筛选） ===')
+            for wc in web_cases:
+                context_parts.append(f"【案例】{wc['title']}\n{wc['body']}")
+                web_citations.append({'title': wc['title'][:40], 'source': '案例搜索', 'url': wc['url']})
+
+        context = '\n\n'.join(context_parts)
+
+        # 4. 调用AI（案例专用提示词）
+        if DEEPSEEK_API_KEY:
+            ai_answer = self._call_deepseek(question, context, history, case_mode=True)
+            if ai_answer:
+                return {'answer': ai_answer, 'citations': citations, 'web_citations': web_citations, 'ai_used': True}
+
+        # 降级：直接展示搜索结果
+        parts = []
+        if local_case:
+            parts.append(f"找到以下 {len(local_case)} 条库内相关内容：\n")
+            for chunk in local_case[:4]:
+                src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
+                parts.append(f"【{chunk['title']}】（{src_display}）\n{chunk['content'][:400]}")
+        if web_cases:
+            parts.append(f"\n联网找到 {len(web_cases)} 条相关案例：")
+            for wc in web_cases[:4]:
+                parts.append(f"• {wc['title']}\n  {wc['url']}")
+        return {'answer': '\n\n'.join(parts) if parts else '未找到相关案例。',
+                'citations': citations, 'web_citations': web_citations, 'ai_used': False}
+
+    def _call_deepseek(self, question, context, history=None, has_web=False, case_mode=False):
+        """调用 DeepSeek API（支持多轮对话上下文、联网搜索和案例模式）"""
+        if case_mode:
+            system_prompt = (
+                '你是一位专业的中国法律案例分析专家，名叫"法小智"。你精通最高人民法院和最高人民检察院发布的'
+                '指导性案例、典型案例，以及各级法院的重要判例。\n\n'
+                '回答要求：\n'
+                '1. 结合提供的案例资料和联网搜索结果，分析相关典型案例\n'
+                '2. 说明案例的裁判要旨、法律适用要点\n'
+                '3. 引用具体案例名称和裁判观点\n'
+                '4. 结合相关法律条文分析案例的法律依据\n'
+                '5. 如果涉及多个案例，归纳共同的法律原则\n'
+                '6. 注明案例来源（如"据最高人民法院发布的第X批指导性案例"）\n'
+                '7. 回答末尾提醒：具体案件建议咨询专业律师\n'
+                '8. 不要编造不存在的案例'
+            )
+        else:
+            system_prompt = (
+                '你是一位专业的中国法律顾问，名叫"法小智"。你拥有涵盖宪法、民法典、刑法、行政法、经济法、'
+                '社会法、诉讼法、司法解释等4800余部法律法规的完整知识库。请根据提供的法律条文回答用户的问题。\n\n'
+                '回答要求：\n'
+                '1. 准确引用具体法条（如"根据《民法典》第577条"）\n'
+                '2. 用通俗易懂的语言解释法律含义\n'
+                '3. 如果涉及多个法条，分点说明\n'
+                '4. 如果提供的法条不足以完整回答，请如实说明并给出一般性法律建议\n'
+                '5. 回答末尾提醒用户：具体案件建议咨询专业律师\n'
+                '6. 不要编造不存在的法条\n'
+                '7. 结合之前的对话上下文理解用户的追问，保持回答连贯'
+            )
         if has_web:
             system_prompt += (
                 '\n8. 本次回答附带了联网搜索到的资料（已初步筛选）。请仔细甄别，只采纳其中权威、准确、'
@@ -527,6 +646,8 @@ def chat():
     use_web = bool(data.get('use_web', False))
     if mode == 'search':
         result = dm.search_only(question)
+    elif mode == 'case':
+        result = dm.answer_with_cases(question, history)
     else:
         result = dm.answer_with_ai(question, history, use_web)
     return jsonify(result)
@@ -633,6 +754,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .mode-toggle .mt-label.active{background:#4299e1;color:#fff;border-color:#4299e1;font-weight:600}
   .mode-toggle .mt-label.active-search{background:#38a169;color:#fff;border-color:#38a169;font-weight:600}
   .mode-toggle .mt-label.active-web{background:#805ad5;color:#fff;border-color:#805ad5;font-weight:600}
+  .mode-toggle .mt-label.active-case{background:#d69e2e;color:#fff;border-color:#d69e2e;font-weight:600}
   .mode-toggle .mt-hint{font-size:11px;color:#a0aec0;margin-left:4px}
   ::-webkit-scrollbar{width:6px}
   ::-webkit-scrollbar-track{background:transparent}
@@ -644,8 +766,8 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 <div class="header">
   <span class="icon">&#9878;</span>
   <h1>法律问答助手</h1>
-  <span class="sub">DeepSeek AI · 1661部法律法规 + 司法解释</span>
-  <span class="badge">全量法律库 v4.0</span>
+  <span class="sub">DeepSeek AI · 4868部法律法规 + 司法解释 + 典型案例</span>
+  <span class="badge">全量法律库 v4.5</span>
 </div>
 <div class="main">
   <div class="sidebar">
@@ -662,20 +784,23 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
     <div class="flk-link">
       <a href="https://flk.npc.gov.cn/" target="_blank">&#128279; 在国家法律法规数据库中搜索</a>
     </div>
+    <div class="flk-link" style="margin-top:0">
+      <a href="https://rmfyalk.court.gov.cn/" target="_blank">&#9878; 在人民法院案例库中检索案例</a>
+    </div>
   </div>
   <div class="chat-area">
     <div class="messages" id="messages">
       <div class="welcome" id="welcome">
         <div class="wi">&#9878;</div>
         <h2>你好，我是法小智</h2>
-        <p>我已内置 <b>1661部</b> 法律法规及两高司法解释，涵盖宪法、民法典、刑法、行政法、经济法、社会法、诉讼法等全部法律门类，由 DeepSeek AI 驱动。<br>直接输入法律问题即可获得智能解答。</p>
+        <p>我已内置 <b>4868部</b> 法律法规、司法解释及典型案例，涵盖宪法、民法典、刑法、行政法、经济法、社会法、诉讼法等全部法律门类，由 DeepSeek AI 驱动。<br>直接输入法律问题即可获得智能解答，也可搜索两高典型案例。</p>
         <div class="tips">
           <span class="tt" onclick="fill('什么是正当防卫？')">什么是正当防卫？</span>
           <span class="tt" onclick="fill('合同违约怎么赔偿？')">合同违约怎么赔偿？</span>
           <span class="tt" onclick="fill('离婚财产如何分割？')">离婚财产如何分割？</span>
-          <span class="tt" onclick="fill('遗产继承的顺序是什么？')">遗产继承的顺序？</span>
           <span class="tt" onclick="fill('劳动者被辞退有什么补偿？')">被辞退有什么补偿？</span>
-          <span class="tt" onclick="fill('交通肇事罪怎么量刑？')">交通肇事罪量刑？</span>
+          <span class="tt" onclick="setMode('case');fill('正当防卫的典型案例有哪些？')">正当防卫典型案例</span>
+          <span class="tt" onclick="setMode('case');fill('劳动争议典型案例')">劳动争议典型案例</span>
         </div>
       </div>
     </div>
@@ -684,6 +809,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
         <div class="mode-toggle">
           <span class="mt-label active" id="modeAi" onclick="setMode('ai')">&#129302; AI智能回答</span>
           <span class="mt-label" id="modeSearch" onclick="setMode('search')">&#128269; 直接搜索</span>
+          <span class="mt-label" id="modeCase" onclick="setMode('case')">&#9878; 案例搜索</span>
           <span class="mt-label" id="modeWeb" onclick="toggleWeb()" title="开启后同时联网搜索权威法律信息（已筛选）">&#127760; 联网搜索</span>
           <span class="mt-hint" id="modeHint">AI回答更精准，消耗tokens</span>
         </div>
@@ -706,9 +832,11 @@ function toggleWeb(){
 }
 function setMode(m){
   chatMode=m;
-  const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),hint=document.getElementById('modeHint');
-  if(m==='ai'){ai.className='mt-label active';se.className='mt-label';hint.textContent='AI回答更精准，消耗tokens'}
-  else{ai.className='mt-label';se.className='mt-label active-search';hint.textContent='直接搜索法律库，免费不消耗tokens'}
+  const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),ca=document.getElementById('modeCase'),hint=document.getElementById('modeHint');
+  ai.className='mt-label';se.className='mt-label';ca.className='mt-label';
+  if(m==='ai'){ai.className='mt-label active';hint.textContent='AI回答更精准，消耗tokens'}
+  else if(m==='search'){se.className='mt-label active-search';hint.textContent='直接搜索法律库，免费不消耗tokens'}
+  else if(m==='case'){ca.className='mt-label active-case';hint.textContent='搜索两高典型案例，联网+AI分析'}
 }
 function setBtnStop(isStop){
   const b=document.getElementById('sendBtn');
@@ -807,7 +935,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print()
     print('=' * 50)
-    print('    法律问答助手 v4.0 (全量法律库 + DeepSeek AI)')
+    print('    法律问答助手 v4.5 (全量法律库 + AI + 案例搜索)')
     print(f'    内置法律: {dm.law_count} 部, {len(dm.chunks)} 个条文')
     print(f'    AI 引擎:  {"DeepSeek" if DEEPSEEK_API_KEY else "未配置"}')
     print(f'    访问:     http://127.0.0.1:{port}')

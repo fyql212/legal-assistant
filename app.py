@@ -24,11 +24,17 @@ except ImportError:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'jieba'])
     import jieba
 
+WEB_SEARCH_AVAILABLE = False
+DDGS = None
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
     WEB_SEARCH_AVAILABLE = True
 except ImportError:
-    WEB_SEARCH_AVAILABLE = False
+    try:
+        from duckduckgo_search import DDGS
+        WEB_SEARCH_AVAILABLE = True
+    except ImportError:
+        WEB_SEARCH_AVAILABLE = False
 
 # ==================== 配置 ====================
 app = Flask(__name__)
@@ -64,12 +70,15 @@ def web_search(question, max_results=6):
     try:
         # 加上法律相关限定词，提高结果质量
         query = f'{question} 法律 法规 司法解释'
-        with DDGS() as ddgs:
-            raw = list(ddgs.text(query, region='cn-zh', max_results=15))
+        try:
+            raw = list(DDGS().text(query, region='cn-zh', max_results=15))
+        except TypeError:
+            # 某些版本不支持region参数
+            raw = list(DDGS().text(query, max_results=15))
         for item in raw:
-            url = item.get('href', '') or item.get('url', '')
+            url = item.get('href', '') or item.get('url', '') or item.get('link', '')
             title = (item.get('title', '') or '').strip()
-            body = (item.get('body', '') or item.get('snippet', '') or '').strip()
+            body = (item.get('body', '') or item.get('snippet', '') or item.get('content', '') or '').strip()
             if not title or not body:
                 continue
             # 域名白名单筛选（只保留可信法律来源）
@@ -445,6 +454,21 @@ def health():
 @app.route('/api/stats')
 def stats():
     return jsonify(dm.get_stats())
+
+@app.route('/api/websearch_debug')
+def websearch_debug():
+    """调试端点：诊断联网搜索在当前服务器环境是否可用（不消耗tokens）"""
+    info = {'available': WEB_SEARCH_AVAILABLE, 'backend': 'none'}
+    if DDGS is not None:
+        info['backend'] = getattr(DDGS, '__module__', 'unknown')
+    q = request.args.get('q', '劳动合同 试用期 法律')
+    try:
+        raw_results = web_search(q, max_results=5)
+        info['count'] = len(raw_results)
+        info['results'] = [{'title': r['title'][:50], 'url': r['url'][:80], 'trusted': r['trusted']} for r in raw_results]
+    except Exception as e:
+        info['error'] = str(e)[:300]
+    return jsonify(info)
 
 @app.route('/api/upload', methods=['POST'])
 def upload():

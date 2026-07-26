@@ -405,6 +405,19 @@ def chat():
         result = dm.answer_with_ai(question)
     return jsonify(result)
 
+@app.route('/api/article', methods=['GET'])
+def get_article():
+    source = request.args.get('source', '')
+    title = request.args.get('title', '')
+    if not source or not title:
+        return jsonify(error='缺少参数'), 400
+    # 在chunks中查找匹配的法条
+    for chunk in dm.chunks:
+        src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
+        if chunk['title'] == title and (src_display == source or source in chunk['source']):
+            return jsonify(found=True, title=chunk['title'], source=src_display, content=chunk['content'])
+    return jsonify(found=False, error='未找到该条文')
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -477,7 +490,8 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .typing-indicator span:nth-child(3){animation-delay:.4s}
   @keyframes bounce{0%,80%,100%{transform:scale(.6);opacity:.4}40%{transform:scale(1);opacity:1}}
   .citation-tags{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
-  .citation-tag{background:#ebf8ff;color:#2b6cb0;font-size:11px;padding:3px 10px;border-radius:12px}
+  .citation-tag{background:#ebf8ff;color:#2b6cb0;font-size:11px;padding:3px 10px;border-radius:12px;cursor:pointer;transition:all .15s;border:1px solid transparent}
+  .citation-tag:hover{background:#bee3f8;border-color:#4299e1;text-decoration:underline}
   .input-area{padding:16px 32px 20px;background:#fff;border-top:1px solid #e2e8f0;display:flex;gap:12px;align-items:flex-end}
   .input-area textarea{flex:1;border:2px solid #e2e8f0;border-radius:12px;padding:12px 16px;font-size:14px;font-family:inherit;resize:none;outline:none;max-height:120px;line-height:1.5;transition:border-color .15s}
   .input-area textarea:focus{border-color:#4299e1}
@@ -607,7 +621,7 @@ function addMsg(role,text,cites,aiUsed){
   const c=document.getElementById('messages'),r=document.createElement('div');r.className='msg-row '+role;
   const av=role==='user'?'&#128100;':'&#9878;';
   let aiBadge=(aiUsed&&role==='bot')?'<div class="ai-badge">&#129302; DeepSeek AI 回答</div>':'';
-  let ch='';if(cites&&cites.length)ch='<div class="citation-tags">'+cites.map(c=>'<span class="citation-tag">'+esc(c.title+' · '+c.source.replace(/^upload_/,''))+'</span>').join('')+'</div>';
+  let ch='';if(cites&&cites.length)ch='<div class="citation-tags">'+cites.map(c=>'<span class="citation-tag" onclick="showArticle(\''+esc(c.title).replace(/'/g,"\\'")+'\',\''+esc(c.source).replace(/'/g,"\\'")+'\')" title="点击查看原文">'+esc(c.title+' · '+c.source.replace(/^upload_/,''))+'</span>').join('')+'</div>';
   r.innerHTML=(role==='user'?'':'<div class="msg-avatar">'+av+'</div>')+'<div class="msg-bubble">'+aiBadge+esc(text)+ch+'</div>'+(role==='user'?'<div class="msg-avatar">'+av+'</div>':'');
   c.appendChild(r);c.scrollTop=c.scrollHeight
 }
@@ -617,6 +631,22 @@ function addTyping(){
   c.appendChild(r);c.scrollTop=c.scrollHeight;return r
 }
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+async function showArticle(title,source){
+  if(busy)return;
+  busy=true;
+  const ld=addTyping();
+  try{
+    const r=await fetch('/api/article?title='+encodeURIComponent(title)+'&source='+encodeURIComponent(source));
+    const d=await r.json();
+    ld.remove();
+    if(d.found){
+      addMsg('bot','📜 '+d.title+'（'+d.source+'）\n\n'+d.content,[],false);
+    }else{
+      addMsg('bot','抱歉，未能找到该条文原文。',[],false);
+    }
+  }catch{ld.remove();addMsg('bot','网络错误，请稍后再试。',[],false)}
+  busy=false;
+}
 </script>
 </body>
 </html>'''

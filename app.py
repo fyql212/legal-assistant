@@ -242,8 +242,8 @@ class LegalDocManager:
             citations.append({'title': chunk['title'], 'source': src_display})
         return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'ai_used': False}
 
-    def answer_with_ai(self, question):
-        """搜索法条 + DeepSeek 智能回答"""
+    def answer_with_ai(self, question, history=None):
+        """搜索法条 + DeepSeek 智能回答（支持上下文）"""
         results = self.search(question)
 
         if not self.chunks:
@@ -251,7 +251,7 @@ class LegalDocManager:
 
         if not results:
             if DEEPSEEK_API_KEY:
-                ai_answer = self._call_deepseek(question, '')
+                ai_answer = self._call_deepseek(question, '', history)
                 if ai_answer:
                     return {'answer': ai_answer, 'citations': [], 'ai_used': True}
             return {'answer': '抱歉，没有找到相关法律条文。建议换一种方式提问，或上传更多法律文件。',
@@ -268,7 +268,7 @@ class LegalDocManager:
 
         # 调用 DeepSeek
         if DEEPSEEK_API_KEY:
-            ai_answer = self._call_deepseek(question, context)
+            ai_answer = self._call_deepseek(question, context, history)
             if ai_answer:
                 return {'answer': ai_answer, 'citations': citations, 'ai_used': True}
 
@@ -285,8 +285,8 @@ class LegalDocManager:
             display_parts.append(f"【{chunk['title']}】（{src_display}）\n{display}")
         return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'ai_used': False}
 
-    def _call_deepseek(self, question, context):
-        """调用 DeepSeek API"""
+    def _call_deepseek(self, question, context, history=None):
+        """调用 DeepSeek API（支持多轮对话上下文）"""
         system_prompt = (
             '你是一位专业的中国法律顾问，名叫"法小智"。你拥有涵盖宪法、民法典、刑法、行政法、经济法、'
             '社会法、诉讼法、司法解释等1600余部法律法规的完整知识库。请根据提供的法律条文回答用户的问题。\n\n'
@@ -296,22 +296,27 @@ class LegalDocManager:
             '3. 如果涉及多个法条，分点说明\n'
             '4. 如果提供的法条不足以完整回答，请如实说明并给出一般性法律建议\n'
             '5. 回答末尾提醒用户：具体案件建议咨询专业律师\n'
-            '6. 不要编造不存在的法条'
+            '6. 不要编造不存在的法条\n'
+            '7. 结合之前的对话上下文理解用户的追问，保持回答连贯'
         )
         if context:
             user_msg = f'以下是相关法律条文：\n\n{context}\n\n---\n用户问题：{question}'
         else:
             user_msg = f'用户问题：{question}\n\n（未找到直接相关的法条，请根据你的法律知识回答，并注明仅供参考）'
+        messages = [{'role': 'system', 'content': system_prompt}]
+        # 加入历史对话（最多保留最近6轮，控制token消耗）
+        if history:
+            for h in history[-12:]:
+                if h.get('role') in ('user', 'assistant') and h.get('content'):
+                    messages.append({'role': h['role'], 'content': h['content']})
+        messages.append({'role': 'user', 'content': user_msg})
         try:
             resp = http_requests.post(
                 DEEPSEEK_URL,
                 headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {DEEPSEEK_API_KEY}'},
                 json={
                     'model': DEEPSEEK_MODEL,
-                    'messages': [
-                        {'role': 'system', 'content': system_prompt},
-                        {'role': 'user', 'content': user_msg}
-                    ],
+                    'messages': messages,
                     'temperature': 0.3,
                     'max_tokens': 2000,
                 },
@@ -399,10 +404,11 @@ def chat():
         return jsonify(error='请输入问题'), 400
     question = data['question'].strip()
     mode = data.get('mode', 'ai')
+    history = data.get('history', [])
     if mode == 'search':
         result = dm.search_only(question)
     else:
-        result = dm.answer_with_ai(question)
+        result = dm.answer_with_ai(question, history)
     return jsonify(result)
 
 @app.route('/api/article', methods=['GET'])
@@ -569,6 +575,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 let busy=false;
 let chatMode='ai';
 let abortCtrl=null;
+let chatHistory=[];
 function setMode(m){
   chatMode=m;
   const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),hint=document.getElementById('modeHint');
@@ -623,10 +630,13 @@ async function send(){
   if(busy)return;const inp=document.getElementById('qInput'),q=inp.value.trim();if(!q)return;
   const w=document.getElementById('welcome');if(w)w.style.display='none';
   addMsg('user',q);inp.value='';inp.style.height='auto';
+  chatHistory.push({role:'user',content:q});
   busy=true;setBtnStop(true);abortCtrl=new AbortController();const ld=addTyping();
-  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode}),signal:abortCtrl.signal});const d=await r.json();
-    ld.remove();if(d.answer)addMsg('bot',d.answer,d.citations,d.ai_used);else if(d.error)addMsg('bot','错误：'+d.error)}
-  catch(e){ld.remove();if(e.name==='AbortError')addMsg('bot','⏹ 已取消提问，未消耗tokens。',[],false);else addMsg('bot','网络错误，请稍后再试。')}
+  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode,history:chatHistory.slice(0,-1)}),signal:abortCtrl.signal});const d=await r.json();
+    ld.remove();
+    if(d.answer){addMsg('bot',d.answer,d.citations,d.ai_used);chatHistory.push({role:'assistant',content:d.answer})}
+    else if(d.error)addMsg('bot','错误：'+d.error)}
+  catch(e){ld.remove();if(e.name==='AbortError'){addMsg('bot','⏹ 已取消提问，未消耗tokens。',[],false);chatHistory.pop()}else addMsg('bot','网络错误，请稍后再试。')}
   busy=false;abortCtrl=null;setBtnStop(false)
 }
 function addMsg(role,text,cites,aiUsed){

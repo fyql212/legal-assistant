@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════╗
-║     法律问答助手 v3.0 — DeepSeek 智能版              ║
+║     法律问答助手 v4.0 — 全量法律库 + DeepSeek AI     ║
 ║                                                      ║
-║  内置法律库：宪法、民法典（开箱即用，无需上传）         ║
+║  内置法律库：1661部法律法规 + 两高司法解释            ║
 ║  AI 引擎：  DeepSeek 大模型智能回答                   ║
 ║  部署平台：Railway.com                                ║
 ╚══════════════════════════════════════════════════════╝
@@ -12,6 +12,7 @@
 import os
 import re
 import json
+import gzip
 import glob
 import requests as http_requests
 from flask import Flask, request, jsonify, render_template_string
@@ -30,34 +31,55 @@ app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
 DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions'
 DEEPSEEK_MODEL = 'deepseek-v4-flash'
-LAWS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'laws')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LAWS_DATA_FILE = os.path.join(BASE_DIR, 'laws_data.json.gz')
+LAWS_DIR = os.path.join(BASE_DIR, 'laws')
 
 # ==================== 文档管理器 ====================
 class LegalDocManager:
     def __init__(self):
         self.documents = {}
         self.chunks = []
+        self.law_count = 0
+        self.category_count = 0
 
     def load_builtin_laws(self):
-        """启动时加载内置法律文件"""
-        if not os.path.isdir(LAWS_DIR):
-            return
-        for filepath in glob.glob(os.path.join(LAWS_DIR, '*.txt')):
-            name = os.path.basename(filepath)
+        """启动时加载全量法律数据"""
+        categories = set()
+        # 优先加载压缩数据文件（全量法律库）
+        if os.path.isfile(LAWS_DATA_FILE):
             try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                if content.strip():
-                    self.documents[name] = content
-            except Exception:
+                with gzip.open(LAWS_DATA_FILE, 'rt', encoding='utf-8') as f:
+                    laws = json.load(f)
+                for law in laws:
+                    title = law.get('title', '')
+                    category = law.get('category', '其他')
+                    content = law.get('content', '')
+                    if not title or not content.strip():
+                        continue
+                    key = f'{category}/{title}'
+                    self.documents[key] = content
+                    categories.add(category)
+                self.law_count = len(self.documents)
+                self.category_count = len(categories)
+                print(f'[法律库] 已加载 {self.law_count} 部法律, {self.category_count} 个分类')
+            except Exception as e:
+                print(f'[法律库] 加载压缩数据失败: {e}')
+        # 兼容：也加载 laws/ 目录下的 txt 文件
+        if os.path.isdir(LAWS_DIR):
+            for filepath in glob.glob(os.path.join(LAWS_DIR, '*.txt')):
+                name = os.path.basename(filepath)
+                if name in self.documents:
+                    continue
                 try:
-                    with open(filepath, 'r', encoding='gbk') as f:
+                    with open(filepath, 'r', encoding='utf-8') as f:
                         content = f.read()
                     if content.strip():
                         self.documents[name] = content
                 except Exception:
                     pass
         self._rebuild_chunks()
+        print(f'[法律库] 共 {len(self.documents)} 部文档, {len(self.chunks)} 个条文/段落')
 
     def add_document(self, filename, content):
         self.documents[filename] = content
@@ -75,6 +97,16 @@ class LegalDocManager:
             builtin = not name.startswith('upload_')
             result.append({'name': name, 'articles': art, 'chunks': total, 'builtin': builtin})
         return result
+
+    def get_stats(self):
+        """返回法律库统计信息"""
+        cats = {}
+        for name in self.documents:
+            if name.startswith('upload_'):
+                continue
+            cat = name.split('/')[0] if '/' in name else '其他'
+            cats[cat] = cats.get(cat, 0) + 1
+        return {'total': self.law_count, 'categories': cats, 'chunks': len(self.chunks)}
 
     def _rebuild_chunks(self):
         self.chunks = []
@@ -154,13 +186,17 @@ class LegalDocManager:
                 result.append(w)
         return result
 
-    def search(self, question, top_n=8):
+    def search(self, question, top_n=10):
         kws = self._keywords(question)
         if not kws:
             return []
         asked_nums = set()
         for m in re.finditer(r'第([零一二三四五六七八九十百千\d]+)条', question):
             asked_nums.add(self._cn2int(m.group(1)))
+        # 提取问题中提到的法律名称
+        law_names = set()
+        for m in re.finditer(r'《(.+?)》', question):
+            law_names.add(m.group(1))
         scored = []
         for chunk in self.chunks:
             score = 0.0
@@ -173,6 +209,12 @@ class LegalDocManager:
                 cn = self._cn2int(chunk['article_num'])
                 if cn in asked_nums:
                     score += 50
+            # 法律名称匹配加分
+            if law_names:
+                src = chunk['source']
+                for ln in law_names:
+                    if ln in src:
+                        score += 30
             if score > 0:
                 scored.append((score, chunk))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -197,8 +239,9 @@ class LegalDocManager:
         context_parts = []
         citations = []
         for chunk in results:
-            context_parts.append(f"【{chunk['title']}】（{chunk['source']}）\n{chunk['content']}")
-            citations.append({'title': chunk['title'], 'source': chunk['source']})
+            src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
+            context_parts.append(f"【{chunk['title']}】（{src_display}）\n{chunk['content']}")
+            citations.append({'title': chunk['title'], 'source': src_display})
         context = '\n\n'.join(context_parts)
 
         # 调用 DeepSeek
@@ -215,14 +258,16 @@ class LegalDocManager:
         header += '：\n\n'
         display_parts = []
         for chunk in results[:5]:
+            src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
             display = chunk['content'][:500] + ('……' if len(chunk['content']) > 500 else '')
-            display_parts.append(f"【{chunk['title']}】（{chunk['source']}）\n{display}")
+            display_parts.append(f"【{chunk['title']}】（{src_display}）\n{display}")
         return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'ai_used': False}
 
     def _call_deepseek(self, question, context):
         """调用 DeepSeek API"""
         system_prompt = (
-            '你是一位专业的中国法律顾问，名叫"法小智"。请根据提供的法律条文回答用户的问题。\n\n'
+            '你是一位专业的中国法律顾问，名叫"法小智"。你拥有涵盖宪法、民法典、刑法、行政法、经济法、'
+            '社会法、诉讼法、司法解释等1600余部法律法规的完整知识库。请根据提供的法律条文回答用户的问题。\n\n'
             '回答要求：\n'
             '1. 准确引用具体法条（如"根据《民法典》第577条"）\n'
             '2. 用通俗易懂的语言解释法律含义\n'
@@ -287,7 +332,12 @@ def extract_text(file_storage, filename):
 @app.route('/api/health')
 def health():
     return jsonify(status='ok', docs=len(dm.documents), chunks=len(dm.chunks),
+                   laws=dm.law_count, categories=dm.category_count,
                    ai='deepseek' if DEEPSEEK_API_KEY else 'off')
+
+@app.route('/api/stats')
+def stats():
+    return jsonify(dm.get_stats())
 
 @app.route('/api/upload', methods=['POST'])
 def upload():
@@ -338,7 +388,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>法律问答助手 - AI 智能版</title>
+<title>法律问答助手 - 全量法律库 AI 版</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#eef2f7;color:#333;height:100vh;display:flex;flex-direction:column;overflow:hidden}
@@ -350,10 +400,12 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .main{flex:1;display:flex;overflow:hidden}
   .sidebar{width:300px;background:#fff;border-right:1px solid #e2e8f0;display:flex;flex-direction:column;flex-shrink:0}
   .sidebar-title{padding:18px 20px 10px;font-size:16px;font-weight:600;color:#2d3748}
-  .upload-zone{margin:8px 16px;border:2px dashed #cbd5e0;border-radius:12px;padding:20px 16px;text-align:center;cursor:pointer;transition:all .2s;position:relative}
+  .stats-bar{margin:0 16px 8px;padding:10px 14px;background:linear-gradient(135deg,#ebf8ff,#e6fffa);border-radius:10px;font-size:12px;color:#2c5282;line-height:1.6}
+  .stats-bar b{color:#1a365d}
+  .upload-zone{margin:8px 16px;border:2px dashed #cbd5e0;border-radius:12px;padding:16px;text-align:center;cursor:pointer;transition:all .2s;position:relative}
   .upload-zone:hover,.upload-zone.dragover{border-color:#4299e1;background:#ebf8ff}
-  .upload-zone .ui{font-size:32px;color:#a0aec0}
-  .upload-zone p{font-size:13px;color:#718096;margin-top:6px}
+  .upload-zone .ui{font-size:28px;color:#a0aec0}
+  .upload-zone p{font-size:13px;color:#718096;margin-top:4px}
   .upload-zone small{font-size:12px;color:#a0aec0}
   .upload-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer}
   .upload-status{margin:0 16px;padding:8px;border-radius:8px;font-size:13px;display:none}
@@ -378,7 +430,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .welcome{text-align:center;margin-top:50px;color:#a0aec0}
   .welcome .wi{font-size:60px;margin-bottom:14px}
   .welcome h2{font-size:20px;color:#4a5568;margin-bottom:10px}
-  .welcome p{font-size:14px;line-height:1.8;max-width:440px;margin:0 auto}
+  .welcome p{font-size:14px;line-height:1.8;max-width:480px;margin:0 auto}
   .welcome .tips{margin-top:24px;display:flex;flex-wrap:wrap;justify-content:center;gap:10px}
   .welcome .tt{background:#fff;border:1px solid #e2e8f0;border-radius:20px;padding:8px 16px;font-size:13px;color:#4a5568;cursor:pointer;transition:all .15s}
   .welcome .tt:hover{background:#ebf8ff;border-color:#4299e1;color:#2b6cb0}
@@ -415,12 +467,13 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 <div class="header">
   <span class="icon">&#9878;</span>
   <h1>法律问答助手</h1>
-  <span class="sub">DeepSeek AI 驱动 · 内置宪法/民法典</span>
-  <span class="badge">AI 智能版</span>
+  <span class="sub">DeepSeek AI · 1661部法律法规 + 司法解释</span>
+  <span class="badge">全量法律库 v4.0</span>
 </div>
 <div class="main">
   <div class="sidebar">
     <div class="sidebar-title">&#128218; 法律知识库</div>
+    <div class="stats-bar" id="statsBar">正在加载法律库统计…</div>
     <div class="upload-zone" id="uploadZone">
       <div class="ui">&#128228;</div>
       <p>上传更多法律文件</p>
@@ -438,13 +491,14 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
       <div class="welcome" id="welcome">
         <div class="wi">&#9878;</div>
         <h2>你好，我是法小智</h2>
-        <p>我已内置《宪法》和《民法典》，由 DeepSeek AI 驱动。<br>直接输入法律问题即可获得智能解答。</p>
+        <p>我已内置 <b>1661部</b> 法律法规及两高司法解释，涵盖宪法、民法典、刑法、行政法、经济法、社会法、诉讼法等全部法律门类，由 DeepSeek AI 驱动。<br>直接输入法律问题即可获得智能解答。</p>
         <div class="tips">
           <span class="tt" onclick="fill('什么是正当防卫？')">什么是正当防卫？</span>
           <span class="tt" onclick="fill('合同违约怎么赔偿？')">合同违约怎么赔偿？</span>
           <span class="tt" onclick="fill('离婚财产如何分割？')">离婚财产如何分割？</span>
           <span class="tt" onclick="fill('遗产继承的顺序是什么？')">遗产继承的顺序？</span>
           <span class="tt" onclick="fill('劳动者被辞退有什么补偿？')">被辞退有什么补偿？</span>
+          <span class="tt" onclick="fill('交通肇事罪怎么量刑？')">交通肇事罪量刑？</span>
         </div>
       </div>
     </div>
@@ -456,7 +510,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 </div>
 <script>
 let busy=false;
-window.addEventListener('DOMContentLoaded',()=>{loadDocs();ar()});
+window.addEventListener('DOMContentLoaded',()=>{loadDocs();loadStats();ar()});
 const fi=document.getElementById('fileInput'),uz=document.getElementById('uploadZone'),us=document.getElementById('uploadStatus');
 fi.addEventListener('change',e=>{if(e.target.files.length)upAll(e.target.files)});
 uz.addEventListener('dragover',e=>{e.preventDefault();uz.classList.add('dragover')});
@@ -471,16 +525,21 @@ async function upOne(file){
   catch{ss('error','网络错误')}
 }
 function ss(t,m){us.className='upload-status '+t;us.textContent=m;if(t==='success')setTimeout(()=>us.className='upload-status',5000)}
+async function loadStats(){
+  try{const r=await fetch('/api/stats');const d=await r.json();
+    const cats=Object.entries(d.categories||{}).sort((a,b)=>b[1]-a[1]).slice(0,6).map(e=>e[0]).join('、');
+    document.getElementById('statsBar').innerHTML='<b>'+d.total+'</b> 部法律法规 · <b>'+d.chunks.toLocaleString()+'</b> 个条文<br>涵盖：'+cats+' 等';
+  }catch{document.getElementById('statsBar').textContent='法律库已就绪'}
+}
 async function loadDocs(){try{const r=await fetch('/api/documents');const d=await r.json();rdl(d.documents)}catch{}}
 function rdl(docs){
   const el=document.getElementById('docList');
-  if(!docs||!docs.length){el.innerHTML='<div style="text-align:center;padding:16px;color:#a0aec0;font-size:13px">暂无文件</div>';return}
-  el.innerHTML=docs.map(d=>{
-    const icon=d.builtin?'&#128214;':(d.name.endsWith('.pdf')?'&#128211;':'&#128196;');
-    const tag=d.builtin?'<span class="tag">内置</span>':'';
-    const del=d.builtin?'':`<button class="dd" onclick="dd('${d.name}')" title="删除">&#10005;</button>`;
+  const uploads=docs.filter(d=>!d.builtin);
+  if(!uploads.length){el.innerHTML='<div style="text-align:center;padding:16px;color:#a0aec0;font-size:13px">内置法律库已包含全部法律法规<br>如需补充可上传文件</div>';return}
+  el.innerHTML='<div style="padding:4px 0 8px;font-size:12px;color:#718096">用户上传 ('+uploads.length+')</div>'+uploads.map(d=>{
+    const icon=d.name.endsWith('.pdf')?'&#128211;':'&#128196;';
     const displayName=d.name.replace(/^upload_/,'');
-    return `<div class="doc-item"><span class="di">${icon}</span><div class="info"><div class="dn" title="${displayName}">${displayName}${tag}</div><div class="dm">${d.articles>0?d.articles+' 条法条':d.chunks+' 个段落'}</div></div>${del}</div>`
+    return `<div class="doc-item"><span class="di">${icon}</span><div class="info"><div class="dn" title="${displayName}">${displayName}</div><div class="dm">${d.articles>0?d.articles+' 条法条':d.chunks+' 个段落'}</div></div><button class="dd" onclick="dd('${d.name}')" title="删除">&#10005;</button></div>`
   }).join('')
 }
 async function dd(n){if(!confirm('确定删除吗？'))return;try{await fetch('/api/documents/'+encodeURIComponent(n),{method:'DELETE'});loadDocs()}catch{alert('删除失败')}}
@@ -520,8 +579,8 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print()
     print('=' * 50)
-    print('    法律问答助手 v3.0 (DeepSeek AI) 已启动！')
-    print(f'    内置法律: {len(dm.documents)} 部, {len(dm.chunks)} 个法条')
+    print('    法律问答助手 v4.0 (全量法律库 + DeepSeek AI)')
+    print(f'    内置法律: {dm.law_count} 部, {len(dm.chunks)} 个条文')
     print(f'    AI 引擎:  {"DeepSeek" if DEEPSEEK_API_KEY else "未配置"}')
     print(f'    访问:     http://127.0.0.1:{port}')
     print('=' * 50)

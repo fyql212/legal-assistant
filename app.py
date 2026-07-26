@@ -220,6 +220,28 @@ class LegalDocManager:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored[:top_n]]
 
+    def search_only(self, question):
+        """纯库搜索模式，不调用AI，不消耗tokens"""
+        results = self.search(question, top_n=8)
+        if not self.chunks:
+            return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
+        if not results:
+            return {'answer': '抱歉，没有找到相关法律条文。建议换一种方式提问，或上传更多法律文件。',
+                    'citations': [], 'ai_used': False}
+        kw_str = '、'.join(self._keywords(question)[:6])
+        header = f"找到以下 {len(results)} 条相关法条"
+        if kw_str:
+            header += f"（关键词：{kw_str}）"
+        header += '：\n\n'
+        citations = []
+        display_parts = []
+        for chunk in results:
+            src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
+            display = chunk['content'][:600] + ('……' if len(chunk['content']) > 600 else '')
+            display_parts.append(f"【{chunk['title']}】（{src_display}）\n{display}")
+            citations.append({'title': chunk['title'], 'source': src_display})
+        return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'ai_used': False}
+
     def answer_with_ai(self, question):
         """搜索法条 + DeepSeek 智能回答"""
         results = self.search(question)
@@ -375,7 +397,12 @@ def chat():
     data = request.get_json(silent=True)
     if not data or not (data.get('question') or '').strip():
         return jsonify(error='请输入问题'), 400
-    result = dm.answer_with_ai(data['question'].strip())
+    question = data['question'].strip()
+    mode = data.get('mode', 'ai')
+    if mode == 'search':
+        result = dm.search_only(question)
+    else:
+        result = dm.answer_with_ai(question)
     return jsonify(result)
 
 @app.route('/')
@@ -457,6 +484,12 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .input-area .send-btn{background:linear-gradient(135deg,#4299e1,#3182ce);color:#fff;border:none;border-radius:12px;padding:12px 24px;font-size:14px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
   .input-area .send-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(66,153,225,.4)}
   .input-area .send-btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+  .mode-toggle{display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px;color:#718096;user-select:none}
+  .mode-toggle .mt-label{cursor:pointer;padding:4px 12px;border-radius:16px;border:1.5px solid #e2e8f0;transition:all .15s;background:#fff}
+  .mode-toggle .mt-label:hover{border-color:#4299e1;color:#2b6cb0}
+  .mode-toggle .mt-label.active{background:#4299e1;color:#fff;border-color:#4299e1;font-weight:600}
+  .mode-toggle .mt-label.active-search{background:#38a169;color:#fff;border-color:#38a169;font-weight:600}
+  .mode-toggle .mt-hint{font-size:11px;color:#a0aec0;margin-left:4px}
   ::-webkit-scrollbar{width:6px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:#cbd5e0;border-radius:3px}
@@ -503,13 +536,27 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
       </div>
     </div>
     <div class="input-area">
-      <textarea id="qInput" rows="1" placeholder="请输入您的法律问题..." onkeydown="hk(event)"></textarea>
+      <div style="flex:1;display:flex;flex-direction:column">
+        <div class="mode-toggle">
+          <span class="mt-label active" id="modeAi" onclick="setMode('ai')">&#129302; AI智能回答</span>
+          <span class="mt-label" id="modeSearch" onclick="setMode('search')">&#128269; 直接搜索</span>
+          <span class="mt-hint" id="modeHint">AI回答更精准，消耗tokens</span>
+        </div>
+        <textarea id="qInput" rows="1" placeholder="请输入您的法律问题..." onkeydown="hk(event)"></textarea>
+      </div>
       <button class="send-btn" id="sendBtn" onclick="send()">发送提问</button>
     </div>
   </div>
 </div>
 <script>
 let busy=false;
+let chatMode='ai';
+function setMode(m){
+  chatMode=m;
+  const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),hint=document.getElementById('modeHint');
+  if(m==='ai'){ai.className='mt-label active';se.className='mt-label';hint.textContent='AI回答更精准，消耗tokens'}
+  else{ai.className='mt-label';se.className='mt-label active-search';hint.textContent='直接搜索法律库，免费不消耗tokens'}
+}
 window.addEventListener('DOMContentLoaded',()=>{loadDocs();loadStats();ar()});
 const fi=document.getElementById('fileInput'),uz=document.getElementById('uploadZone'),us=document.getElementById('uploadStatus');
 fi.addEventListener('change',e=>{if(e.target.files.length)upAll(e.target.files)});
@@ -551,7 +598,7 @@ async function send(){
   const w=document.getElementById('welcome');if(w)w.style.display='none';
   addMsg('user',q);inp.value='';inp.style.height='auto';
   busy=true;document.getElementById('sendBtn').disabled=true;const ld=addTyping();
-  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});const d=await r.json();
+  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode})});const d=await r.json();
     ld.remove();if(d.answer)addMsg('bot',d.answer,d.citations,d.ai_used);else if(d.error)addMsg('bot','错误：'+d.error)}
   catch{ld.remove();addMsg('bot','网络错误，请稍后再试。')}
   busy=false;document.getElementById('sendBtn').disabled=false

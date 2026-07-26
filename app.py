@@ -372,8 +372,37 @@ class LegalDocManager:
             citations.append({'title': chunk['title'], 'source': src_display})
         return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'ai_used': False}
 
-    def answer_with_ai(self, question, history=None, use_web=False):
-        """搜索法条 + DeepSeek 智能回答（支持上下文和联网搜索）"""
+    def search_cases_only(self, question):
+        """纯案例搜索模式，不调用AI，不消耗tokens"""
+        # 搜索库内案例
+        local_results = self.search(question, top_n=6)
+        case_results = [c for c in local_results if '案例' in c['source']]
+        other_results = [c for c in local_results if '案例' not in c['source']]
+        local_case = (case_results + other_results)[:5]
+        # 联网搜索两高典型案例
+        web_cases = case_search(question)
+        if not local_case and not web_cases:
+            return {'answer': '未找到相关典型案例。建议换一种方式提问，或前往人民法院案例库（rmfyalk.court.gov.cn）检索。',
+                    'citations': [], 'web_citations': [], 'ai_used': False}
+        citations = []
+        web_citations = []
+        parts = []
+        if local_case:
+            parts.append(f"【库内相关内容】共 {len(local_case)} 条：\n")
+            for chunk in local_case:
+                src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
+                parts.append(f"● {chunk['title']}（{src_display}）\n{chunk['content'][:400]}")
+                citations.append({'title': chunk['title'], 'source': src_display})
+        if web_cases:
+            parts.append(f"\n【两高典型案例（联网搜索）】共 {len(web_cases)} 条：\n")
+            for wc in web_cases:
+                src_tag = '★官方' if wc['trusted'] else ''
+                parts.append(f"● {wc['title']} {src_tag}\n  {wc['body'][:200]}")
+                web_citations.append({'title': wc['title'][:35], 'source': '案例搜索', 'url': wc['url']})
+        return {'answer': '\n\n'.join(parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
+
+    def answer_with_ai(self, question, history=None, use_web=False, use_case=False):
+        """搜索法条 + DeepSeek 智能回答（支持上下文、联网搜索和案例搜索）"""
         results = self.search(question)
 
         # 联网搜索（经过筛选）
@@ -381,10 +410,15 @@ class LegalDocManager:
         if use_web:
             web_results = web_search(question)
 
-        if not self.chunks and not web_results:
+        # 案例搜索（专门搜两高典型案例）
+        case_results = []
+        if use_case:
+            case_results = case_search(question)
+
+        if not self.chunks and not web_results and not case_results:
             return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
 
-        if not results and not web_results:
+        if not results and not web_results and not case_results:
             if DEEPSEEK_API_KEY:
                 ai_answer = self._call_deepseek(question, '', history)
                 if ai_answer:
@@ -407,11 +441,17 @@ class LegalDocManager:
             for wr in web_results:
                 context_parts.append(f"【网络资料】{wr['title']}\n{wr['body']}")
                 web_citations.append({'title': wr['title'][:30], 'source': '联网搜索', 'url': wr['url']})
+        # 追加案例搜索结果（两高典型案例）
+        if case_results:
+            context_parts.append('=== 以下为搜索到的两高典型案例（已筛选） ===')
+            for cr in case_results:
+                context_parts.append(f"【典型案例】{cr['title']}\n{cr['body']}")
+                web_citations.append({'title': cr['title'][:35], 'source': '案例搜索', 'url': cr['url']})
         context = '\n\n'.join(context_parts)
 
         # 调用 DeepSeek
         if DEEPSEEK_API_KEY:
-            ai_answer = self._call_deepseek(question, context, history, has_web=bool(web_results))
+            ai_answer = self._call_deepseek(question, context, history, has_web=bool(web_results), case_mode=bool(case_results))
             if ai_answer:
                 return {'answer': ai_answer, 'citations': citations, 'web_citations': web_citations, 'ai_used': True}
 
@@ -427,65 +467,6 @@ class LegalDocManager:
             display = chunk['content'][:500] + ('……' if len(chunk['content']) > 500 else '')
             display_parts.append(f"【{chunk['title']}】（{src_display}）\n{display}")
         return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
-
-    def answer_with_cases(self, question, history=None):
-        """案例搜索模式：搜索库内典型案例 + 联网搜索两高案例 + AI分析"""
-        # 1. 在本地库中搜索案例相关内容
-        local_results = self.search(question, top_n=6)
-        # 优先筛选分类含"案例"的结果
-        case_results = [c for c in local_results if '案例' in c['source']]
-        other_results = [c for c in local_results if '案例' not in c['source']]
-        local_case = (case_results + other_results)[:6]
-
-        # 2. 联网搜索两高典型案例
-        web_cases = case_search(question)
-
-        if not local_case and not web_cases:
-            if DEEPSEEK_API_KEY:
-                ai_answer = self._call_deepseek(question, '', history, case_mode=True)
-                if ai_answer:
-                    return {'answer': ai_answer, 'citations': [], 'web_citations': [], 'ai_used': True}
-            return {'answer': '抱歉，未找到相关典型案例。建议换一种方式提问，或前往人民法院案例库（rmfyalk.court.gov.cn）直接检索。',
-                    'citations': [], 'web_citations': [], 'ai_used': False}
-
-        # 3. 构建上下文
-        context_parts = []
-        citations = []
-        if local_case:
-            context_parts.append('=== 库内相关案例/法条 ===')
-            for chunk in local_case:
-                src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
-                context_parts.append(f"【{chunk['title']}】（{src_display}）\n{chunk['content']}")
-                citations.append({'title': chunk['title'], 'source': src_display})
-
-        web_citations = []
-        if web_cases:
-            context_parts.append('=== 联网搜索到的两高典型案例（已筛选） ===')
-            for wc in web_cases:
-                context_parts.append(f"【案例】{wc['title']}\n{wc['body']}")
-                web_citations.append({'title': wc['title'][:40], 'source': '案例搜索', 'url': wc['url']})
-
-        context = '\n\n'.join(context_parts)
-
-        # 4. 调用AI（案例专用提示词）
-        if DEEPSEEK_API_KEY:
-            ai_answer = self._call_deepseek(question, context, history, case_mode=True)
-            if ai_answer:
-                return {'answer': ai_answer, 'citations': citations, 'web_citations': web_citations, 'ai_used': True}
-
-        # 降级：直接展示搜索结果
-        parts = []
-        if local_case:
-            parts.append(f"找到以下 {len(local_case)} 条库内相关内容：\n")
-            for chunk in local_case[:4]:
-                src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
-                parts.append(f"【{chunk['title']}】（{src_display}）\n{chunk['content'][:400]}")
-        if web_cases:
-            parts.append(f"\n联网找到 {len(web_cases)} 条相关案例：")
-            for wc in web_cases[:4]:
-                parts.append(f"• {wc['title']}\n  {wc['url']}")
-        return {'answer': '\n\n'.join(parts) if parts else '未找到相关案例。',
-                'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
     def _call_deepseek(self, question, context, history=None, has_web=False, case_mode=False):
         """调用 DeepSeek API（支持多轮对话上下文、联网搜索和案例模式）"""
@@ -644,12 +625,14 @@ def chat():
     mode = data.get('mode', 'ai')
     history = data.get('history', [])
     use_web = bool(data.get('use_web', False))
+    use_case = bool(data.get('use_case', False))
     if mode == 'search':
-        result = dm.search_only(question)
-    elif mode == 'case':
-        result = dm.answer_with_cases(question, history)
+        if use_case:
+            result = dm.search_cases_only(question)
+        else:
+            result = dm.search_only(question)
     else:
-        result = dm.answer_with_ai(question, history, use_web)
+        result = dm.answer_with_ai(question, history, use_web, use_case)
     return jsonify(result)
 
 @app.route('/api/article', methods=['GET'])
@@ -799,8 +782,8 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
           <span class="tt" onclick="fill('合同违约怎么赔偿？')">合同违约怎么赔偿？</span>
           <span class="tt" onclick="fill('离婚财产如何分割？')">离婚财产如何分割？</span>
           <span class="tt" onclick="fill('劳动者被辞退有什么补偿？')">被辞退有什么补偿？</span>
-          <span class="tt" onclick="setMode('case');fill('正当防卫的典型案例有哪些？')">正当防卫典型案例</span>
-          <span class="tt" onclick="setMode('case');fill('劳动争议典型案例')">劳动争议典型案例</span>
+          <span class="tt" onclick="toggleCase();fill('正当防卫的典型案例有哪些？')">正当防卫典型案例</span>
+          <span class="tt" onclick="toggleCase();fill('劳动争议典型案例')">劳动争议典型案例</span>
         </div>
       </div>
     </div>
@@ -809,7 +792,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
         <div class="mode-toggle">
           <span class="mt-label active" id="modeAi" onclick="setMode('ai')">&#129302; AI智能回答</span>
           <span class="mt-label" id="modeSearch" onclick="setMode('search')">&#128269; 直接搜索</span>
-          <span class="mt-label" id="modeCase" onclick="setMode('case')">&#9878; 案例搜索</span>
+          <span class="mt-label" id="modeCase" onclick="toggleCase()" title="开启后搜索两高典型案例（可搭配AI或单独使用）">&#9878; 案例搜索</span>
           <span class="mt-label" id="modeWeb" onclick="toggleWeb()" title="开启后同时联网搜索权威法律信息（已筛选）">&#127760; 联网搜索</span>
           <span class="mt-hint" id="modeHint">AI回答更精准，消耗tokens</span>
         </div>
@@ -825,18 +808,23 @@ let chatMode='ai';
 let abortCtrl=null;
 let chatHistory=[];
 let useWeb=false;
+let useCase=false;
 function toggleWeb(){
   useWeb=!useWeb;
   const wb=document.getElementById('modeWeb');
   wb.className=useWeb?'mt-label active-web':'mt-label';
 }
+function toggleCase(){
+  useCase=!useCase;
+  const cb=document.getElementById('modeCase');
+  cb.className=useCase?'mt-label active-case':'mt-label';
+}
 function setMode(m){
   chatMode=m;
-  const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),ca=document.getElementById('modeCase'),hint=document.getElementById('modeHint');
-  ai.className='mt-label';se.className='mt-label';ca.className='mt-label';
+  const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),hint=document.getElementById('modeHint');
+  ai.className='mt-label';se.className='mt-label';
   if(m==='ai'){ai.className='mt-label active';hint.textContent='AI回答更精准，消耗tokens'}
-  else if(m==='search'){se.className='mt-label active-search';hint.textContent='直接搜索法律库，免费不消耗tokens'}
-  else if(m==='case'){ca.className='mt-label active-case';hint.textContent='搜索两高典型案例，联网+AI分析'}
+  else{se.className='mt-label active-search';hint.textContent='直接搜索法律库，免费不消耗tokens'}
 }
 function setBtnStop(isStop){
   const b=document.getElementById('sendBtn');
@@ -888,7 +876,7 @@ async function send(){
   addMsg('user',q);inp.value='';inp.style.height='auto';
   chatHistory.push({role:'user',content:q});
   busy=true;setBtnStop(true);abortCtrl=new AbortController();const ld=addTyping();
-  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode,history:chatHistory.slice(0,-1),use_web:useWeb}),signal:abortCtrl.signal});const d=await r.json();
+  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode,history:chatHistory.slice(0,-1),use_web:useWeb,use_case:useCase}),signal:abortCtrl.signal});const d=await r.json();
     ld.remove();
     if(d.answer){addMsg('bot',d.answer,d.citations,d.ai_used,d.web_citations);chatHistory.push({role:'assistant',content:d.answer})}
     else if(d.error)addMsg('bot','错误：'+d.error)}

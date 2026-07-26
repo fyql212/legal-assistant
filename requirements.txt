@@ -4,3 +4,4 @@ jieba==0.42.1
 PyPDF2==3.0.1
 requests==2.32.4
 ddgs==9.14.4
+tencentcloud-sdk-python>=3.0.900

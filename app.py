@@ -498,6 +498,9 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .input-area .send-btn{background:linear-gradient(135deg,#4299e1,#3182ce);color:#fff;border:none;border-radius:12px;padding:12px 24px;font-size:14px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
   .input-area .send-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(66,153,225,.4)}
   .input-area .send-btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+  .input-area .send-btn.stop{background:linear-gradient(135deg,#e53e3e,#c53030);animation:pulse 1.5s infinite}
+  .input-area .send-btn.stop:hover{box-shadow:0 4px 12px rgba(229,62,62,.4)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.8}}
   .mode-toggle{display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px;color:#718096;user-select:none}
   .mode-toggle .mt-label{cursor:pointer;padding:4px 12px;border-radius:16px;border:1.5px solid #e2e8f0;transition:all .15s;background:#fff}
   .mode-toggle .mt-label:hover{border-color:#4299e1;color:#2b6cb0}
@@ -565,11 +568,20 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 <script>
 let busy=false;
 let chatMode='ai';
+let abortCtrl=null;
 function setMode(m){
   chatMode=m;
   const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),hint=document.getElementById('modeHint');
   if(m==='ai'){ai.className='mt-label active';se.className='mt-label';hint.textContent='AI回答更精准，消耗tokens'}
   else{ai.className='mt-label';se.className='mt-label active-search';hint.textContent='直接搜索法律库，免费不消耗tokens'}
+}
+function setBtnStop(isStop){
+  const b=document.getElementById('sendBtn');
+  if(isStop){b.textContent='⏹ 停止';b.className='send-btn stop';b.onclick=cancelSend}
+  else{b.textContent='发送提问';b.className='send-btn';b.onclick=send}
+}
+function cancelSend(){
+  if(abortCtrl){abortCtrl.abort();abortCtrl=null}
 }
 window.addEventListener('DOMContentLoaded',()=>{loadDocs();loadStats();ar()});
 const fi=document.getElementById('fileInput'),uz=document.getElementById('uploadZone'),us=document.getElementById('uploadStatus');
@@ -611,11 +623,11 @@ async function send(){
   if(busy)return;const inp=document.getElementById('qInput'),q=inp.value.trim();if(!q)return;
   const w=document.getElementById('welcome');if(w)w.style.display='none';
   addMsg('user',q);inp.value='';inp.style.height='auto';
-  busy=true;document.getElementById('sendBtn').disabled=true;const ld=addTyping();
-  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode})});const d=await r.json();
+  busy=true;setBtnStop(true);abortCtrl=new AbortController();const ld=addTyping();
+  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode}),signal:abortCtrl.signal});const d=await r.json();
     ld.remove();if(d.answer)addMsg('bot',d.answer,d.citations,d.ai_used);else if(d.error)addMsg('bot','错误：'+d.error)}
-  catch{ld.remove();addMsg('bot','网络错误，请稍后再试。')}
-  busy=false;document.getElementById('sendBtn').disabled=false
+  catch(e){ld.remove();if(e.name==='AbortError')addMsg('bot','⏹ 已取消提问，未消耗tokens。',[],false);else addMsg('bot','网络错误，请稍后再试。')}
+  busy=false;abortCtrl=null;setBtnStop(false)
 }
 function addMsg(role,text,cites,aiUsed){
   const c=document.getElementById('messages'),r=document.createElement('div');r.className='msg-row '+role;

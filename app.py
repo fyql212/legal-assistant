@@ -24,6 +24,12 @@ except ImportError:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'jieba'])
     import jieba
 
+try:
+    from duckduckgo_search import DDGS
+    WEB_SEARCH_AVAILABLE = True
+except ImportError:
+    WEB_SEARCH_AVAILABLE = False
+
 # ==================== 配置 ====================
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024
@@ -33,7 +39,62 @@ DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions'
 DEEPSEEK_MODEL = 'deepseek-v4-flash'
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LAWS_DATA_FILE = os.path.join(BASE_DIR, 'laws_data.json.gz')
+
+# 联网搜索可信法律域名白名单（用于筛选，过滤杂乱信息）
+TRUSTED_LEGAL_DOMAINS = [
+    'court.gov.cn',      # 最高人民法院
+    'spp.gov.cn',        # 最高人民检察院
+    'npc.gov.cn',        # 全国人大
+    'gov.cn',            # 各级政府
+    'pkulaw.com',        # 北大法宝
+    'chinalaw.gov.cn',   # 司法部
+    'rmfyalk.court.gov.cn',  # 人民法院案例库
+    'wenshu.court.gov.cn',   # 中国裁判文书网
+    '12309.gov.cn',      # 中国检察网
+    'ts.12348.gov.cn',   # 中国法律服务网
+]
 LAWS_DIR = os.path.join(BASE_DIR, 'laws')
+
+
+def web_search(question, max_results=6):
+    """联网搜索法律信息，经过域名白名单和相关性筛选，过滤杂乱信息"""
+    if not WEB_SEARCH_AVAILABLE:
+        return []
+    results = []
+    try:
+        # 加上法律相关限定词，提高结果质量
+        query = f'{question} 法律 法规 司法解释'
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(query, region='cn-zh', max_results=15))
+        for item in raw:
+            url = item.get('href', '') or item.get('url', '')
+            title = (item.get('title', '') or '').strip()
+            body = (item.get('body', '') or item.get('snippet', '') or '').strip()
+            if not title or not body:
+                continue
+            # 域名白名单筛选（只保留可信法律来源）
+            is_trusted = any(d in url for d in TRUSTED_LEGAL_DOMAINS)
+            # 相关性筛选：标题或正文需包含法律相关关键词
+            legal_kws = ['法', '条例', '规定', '解释', '判决', '案例', '法院', '检察', '条款', '规章']
+            is_relevant = any(k in title or k in body for k in legal_kws)
+            if not (is_trusted or is_relevant):
+                continue
+            # 优先可信来源
+            results.append({
+                'title': title,
+                'body': body[:400],
+                'url': url,
+                'trusted': is_trusted
+            })
+            if len(results) >= max_results:
+                break
+        # 可信来源排在前面
+        results.sort(key=lambda x: (not x['trusted']))
+    except Exception as e:
+        print(f'[联网搜索] 失败: {e}')
+        return []
+    return results
+
 
 # ==================== 文档管理器 ====================
 class LegalDocManager:
@@ -242,14 +303,19 @@ class LegalDocManager:
             citations.append({'title': chunk['title'], 'source': src_display})
         return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'ai_used': False}
 
-    def answer_with_ai(self, question, history=None):
-        """搜索法条 + DeepSeek 智能回答（支持上下文）"""
+    def answer_with_ai(self, question, history=None, use_web=False):
+        """搜索法条 + DeepSeek 智能回答（支持上下文和联网搜索）"""
         results = self.search(question)
 
-        if not self.chunks:
+        # 联网搜索（经过筛选）
+        web_results = []
+        if use_web:
+            web_results = web_search(question)
+
+        if not self.chunks and not web_results:
             return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
 
-        if not results:
+        if not results and not web_results:
             if DEEPSEEK_API_KEY:
                 ai_answer = self._call_deepseek(question, '', history)
                 if ai_answer:
@@ -264,13 +330,21 @@ class LegalDocManager:
             src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
             context_parts.append(f"【{chunk['title']}】（{src_display}）\n{chunk['content']}")
             citations.append({'title': chunk['title'], 'source': src_display})
+
+        # 追加联网搜索结果（已筛选）
+        web_citations = []
+        if web_results:
+            context_parts.append('=== 以下为联网搜索到的权威法律信息（已筛选） ===')
+            for wr in web_results:
+                context_parts.append(f"【网络资料】{wr['title']}\n{wr['body']}")
+                web_citations.append({'title': wr['title'][:30], 'source': '联网搜索', 'url': wr['url']})
         context = '\n\n'.join(context_parts)
 
         # 调用 DeepSeek
         if DEEPSEEK_API_KEY:
-            ai_answer = self._call_deepseek(question, context, history)
+            ai_answer = self._call_deepseek(question, context, history, has_web=bool(web_results))
             if ai_answer:
-                return {'answer': ai_answer, 'citations': citations, 'ai_used': True}
+                return {'answer': ai_answer, 'citations': citations, 'web_citations': web_citations, 'ai_used': True}
 
         # AI 不可用时的降级方案
         kw_str = '、'.join(self._keywords(question)[:6])
@@ -283,10 +357,10 @@ class LegalDocManager:
             src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
             display = chunk['content'][:500] + ('……' if len(chunk['content']) > 500 else '')
             display_parts.append(f"【{chunk['title']}】（{src_display}）\n{display}")
-        return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'ai_used': False}
+        return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
-    def _call_deepseek(self, question, context, history=None):
-        """调用 DeepSeek API（支持多轮对话上下文）"""
+    def _call_deepseek(self, question, context, history=None, has_web=False):
+        """调用 DeepSeek API（支持多轮对话上下文和联网搜索）"""
         system_prompt = (
             '你是一位专业的中国法律顾问，名叫"法小智"。你拥有涵盖宪法、民法典、刑法、行政法、经济法、'
             '社会法、诉讼法、司法解释等1600余部法律法规的完整知识库。请根据提供的法律条文回答用户的问题。\n\n'
@@ -299,6 +373,12 @@ class LegalDocManager:
             '6. 不要编造不存在的法条\n'
             '7. 结合之前的对话上下文理解用户的追问，保持回答连贯'
         )
+        if has_web:
+            system_prompt += (
+                '\n8. 本次回答附带了联网搜索到的资料（已初步筛选）。请仔细甄别，只采纳其中权威、准确、'
+                '与问题相关的内容，剔除杂乱或不可靠的信息。若网络资料与法律条文冲突，以法律条文为准。'
+                '引用网络资料时请注明来源（如"据最高人民法院发布的典型案例"）。'
+            )
         if context:
             user_msg = f'以下是相关法律条文：\n\n{context}\n\n---\n用户问题：{question}'
         else:
@@ -405,10 +485,11 @@ def chat():
     question = data['question'].strip()
     mode = data.get('mode', 'ai')
     history = data.get('history', [])
+    use_web = bool(data.get('use_web', False))
     if mode == 'search':
         result = dm.search_only(question)
     else:
-        result = dm.answer_with_ai(question, history)
+        result = dm.answer_with_ai(question, history, use_web)
     return jsonify(result)
 
 @app.route('/api/article', methods=['GET'])
@@ -512,6 +593,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .mode-toggle .mt-label:hover{border-color:#4299e1;color:#2b6cb0}
   .mode-toggle .mt-label.active{background:#4299e1;color:#fff;border-color:#4299e1;font-weight:600}
   .mode-toggle .mt-label.active-search{background:#38a169;color:#fff;border-color:#38a169;font-weight:600}
+  .mode-toggle .mt-label.active-web{background:#805ad5;color:#fff;border-color:#805ad5;font-weight:600}
   .mode-toggle .mt-hint{font-size:11px;color:#a0aec0;margin-left:4px}
   ::-webkit-scrollbar{width:6px}
   ::-webkit-scrollbar-track{background:transparent}
@@ -563,6 +645,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
         <div class="mode-toggle">
           <span class="mt-label active" id="modeAi" onclick="setMode('ai')">&#129302; AI智能回答</span>
           <span class="mt-label" id="modeSearch" onclick="setMode('search')">&#128269; 直接搜索</span>
+          <span class="mt-label" id="modeWeb" onclick="toggleWeb()" title="开启后同时联网搜索权威法律信息（已筛选）">&#127760; 联网搜索</span>
           <span class="mt-hint" id="modeHint">AI回答更精准，消耗tokens</span>
         </div>
         <textarea id="qInput" rows="1" placeholder="请输入您的法律问题..." onkeydown="hk(event)"></textarea>
@@ -576,6 +659,12 @@ let busy=false;
 let chatMode='ai';
 let abortCtrl=null;
 let chatHistory=[];
+let useWeb=false;
+function toggleWeb(){
+  useWeb=!useWeb;
+  const wb=document.getElementById('modeWeb');
+  wb.className=useWeb?'mt-label active-web':'mt-label';
+}
 function setMode(m){
   chatMode=m;
   const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),hint=document.getElementById('modeHint');
@@ -632,19 +721,20 @@ async function send(){
   addMsg('user',q);inp.value='';inp.style.height='auto';
   chatHistory.push({role:'user',content:q});
   busy=true;setBtnStop(true);abortCtrl=new AbortController();const ld=addTyping();
-  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode,history:chatHistory.slice(0,-1)}),signal:abortCtrl.signal});const d=await r.json();
+  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode,history:chatHistory.slice(0,-1),use_web:useWeb}),signal:abortCtrl.signal});const d=await r.json();
     ld.remove();
-    if(d.answer){addMsg('bot',d.answer,d.citations,d.ai_used);chatHistory.push({role:'assistant',content:d.answer})}
+    if(d.answer){addMsg('bot',d.answer,d.citations,d.ai_used,d.web_citations);chatHistory.push({role:'assistant',content:d.answer})}
     else if(d.error)addMsg('bot','错误：'+d.error)}
   catch(e){ld.remove();if(e.name==='AbortError'){addMsg('bot','⏹ 已取消提问，未消耗tokens。',[],false);chatHistory.pop()}else addMsg('bot','网络错误，请稍后再试。')}
   busy=false;abortCtrl=null;setBtnStop(false)
 }
-function addMsg(role,text,cites,aiUsed){
+function addMsg(role,text,cites,aiUsed,webCites){
   const c=document.getElementById('messages'),r=document.createElement('div');r.className='msg-row '+role;
   const av=role==='user'?'&#128100;':'&#9878;';
   let aiBadge=(aiUsed&&role==='bot')?'<div class="ai-badge">&#129302; DeepSeek AI 回答</div>':'';
   let ch='';if(cites&&cites.length)ch='<div class="citation-tags">'+cites.map(c=>'<span class="citation-tag" onclick="showArticle(\''+esc(c.title).replace(/'/g,"\\'")+'\',\''+esc(c.source).replace(/'/g,"\\'")+'\')" title="点击查看原文">'+esc(c.title+' · '+c.source.replace(/^upload_/,''))+'</span>').join('')+'</div>';
-  r.innerHTML=(role==='user'?'':'<div class="msg-avatar">'+av+'</div>')+'<div class="msg-bubble">'+aiBadge+esc(text)+ch+'</div>'+(role==='user'?'<div class="msg-avatar">'+av+'</div>':'');
+  let wch='';if(webCites&&webCites.length)wch='<div class="citation-tags">'+webCites.map(w=>'<a class="citation-tag web-cite" href="'+esc(w.url)+'" target="_blank" title="'+esc(w.url)+'">&#127760; '+esc(w.title)+'</a>').join('')+'</div>';
+  r.innerHTML=(role==='user'?'':'<div class="msg-avatar">'+av+'</div>')+'<div class="msg-bubble">'+aiBadge+esc(text)+ch+wch+'</div>'+(role==='user'?'<div class="msg-avatar">'+av+'</div>':'');
   c.appendChild(r);c.scrollTop=c.scrollHeight
 }
 function addTyping(){

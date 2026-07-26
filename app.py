@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════╗
-║   法律问答助手 v4.5 — 全量法律库 + AI + 案例搜索     ║
+║   法律问答助手 v5.0 — 全量法律库 + AI + 案例搜索     ║
 ║                                                      ║
 ║  内置法律库：4868部法律法规 + 司法解释 + 典型案例     ║
 ║  AI 引擎：  DeepSeek 大模型智能回答                   ║
 ║  特色功能：联网搜索 · 两高典型案例检索                ║
+║  用户系统：手机号验证码登录 · 记住我                  ║
 ║  部署平台：Railway.com                                ║
 ╚══════════════════════════════════════════════════════╝
 """
@@ -15,8 +16,16 @@ import re
 import json
 import gzip
 import glob
+import time
+import random
+import string
+import sqlite3
+import secrets
+from datetime import datetime, timedelta
+from functools import wraps
+
 import requests as http_requests
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, g
 
 try:
     import jieba
@@ -37,15 +46,44 @@ except ImportError:
     except ImportError:
         WEB_SEARCH_AVAILABLE = False
 
+# 腾讯云短信SDK
+SMS_AVAILABLE = False
+try:
+    from tencentcloud.common import credential
+    from tencentcloud.common.profile.client_profile import ClientProfile
+    from tencentcloud.common.profile.http_profile import HttpProfile
+    from tencentcloud.sms.v20210111 import sms_client, models as sms_models
+    SMS_AVAILABLE = True
+except ImportError:
+    pass
+
 # ==================== 配置 ====================
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
 DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions'
 DEEPSEEK_MODEL = 'deepseek-v4-flash'
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LAWS_DATA_FILE = os.path.join(BASE_DIR, 'laws_data.json.gz')
+
+# 腾讯云短信配置（环境变量）
+TENCENT_SECRET_ID = os.environ.get('TENCENT_SECRET_ID', '')
+TENCENT_SECRET_KEY = os.environ.get('TENCENT_SECRET_KEY', '')
+SMS_SDK_APP_ID = os.environ.get('SMS_SDK_APP_ID', '')
+SMS_SIGN_NAME = os.environ.get('SMS_SIGN_NAME', '')
+SMS_TEMPLATE_ID = os.environ.get('SMS_TEMPLATE_ID', '')
+
+# 用户数据库
+DB_PATH = os.environ.get('DB_PATH', os.path.join(BASE_DIR, 'users.db'))
+CODE_EXPIRE_MINUTES = 5
+CODE_RESEND_SECONDS = 60
+CODE_LENGTH = 6
+REMEMBER_DAYS = 30  # "记住我"会话时长
 
 # 联网搜索可信法律域名白名单（用于筛选，过滤杂乱信息）
 TRUSTED_LEGAL_DOMAINS = [
@@ -72,18 +110,236 @@ JUNK_DOMAINS = [
 LAWS_DIR = os.path.join(BASE_DIR, 'laws')
 
 
+# ==================== 用户数据库 ====================
+
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute('PRAGMA journal_mode=WAL')
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL,
+            last_login TEXT,
+            login_count INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS verification_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            code TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            used INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_codes_phone ON verification_codes(phone, used);
+        CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
+    ''')
+    conn.commit()
+    conn.close()
+
+
+# ==================== 短信与验证码 ====================
+
+def send_sms_code(phone, code):
+    if not SMS_AVAILABLE:
+        return False, '短信SDK未安装'
+    if not all([TENCENT_SECRET_ID, TENCENT_SECRET_KEY, SMS_SDK_APP_ID, SMS_SIGN_NAME, SMS_TEMPLATE_ID]):
+        return False, '短信配置不完整'
+    try:
+        cred = credential.Credential(TENCENT_SECRET_ID, TENCENT_SECRET_KEY)
+        hp = HttpProfile()
+        hp.reqMethod = "POST"
+        hp.endpoint = "sms.tencentcloudapi.com"
+        cp = ClientProfile()
+        cp.signMethod = "HmacSHA256"
+        cp.httpProfile = hp
+        client = sms_client.SmsClient(cred, "ap-guangzhou", cp)
+        req = sms_models.SendSmsRequest()
+        req.SmsSdkAppId = SMS_SDK_APP_ID
+        req.SignName = SMS_SIGN_NAME
+        req.TemplateId = SMS_TEMPLATE_ID
+        req.TemplateParamSet = [code, str(CODE_EXPIRE_MINUTES)]
+        req.PhoneNumberSet = [f"+86{phone}"]
+        resp = client.SendSms(req)
+        if resp.SendStatusSet and resp.SendStatusSet[0].Code == "Ok":
+            return True, '发送成功'
+        return False, f'发送失败: {resp.SendStatusSet[0].Message if resp.SendStatusSet else "未知"}'
+    except Exception as e:
+        return False, f'短信异常: {str(e)}'
+
+
+def validate_phone(phone):
+    return bool(re.match(r'^1[3-9]\d{9}$', phone))
+
+
+def mask_phone(phone):
+    return phone[:3] + '****' + phone[7:] if len(phone) == 11 else phone
+
+
+def check_rate_limit(phone):
+    db = get_db()
+    row = db.execute(
+        'SELECT created_at FROM verification_codes WHERE phone=? ORDER BY created_at DESC LIMIT 1', (phone,)
+    ).fetchone()
+    if row:
+        elapsed = time.time() - row['created_at']
+        if elapsed < CODE_RESEND_SECONDS:
+            return False, int(CODE_RESEND_SECONDS - elapsed)
+    return True, 0
+
+
+def get_or_create_user(phone):
+    db = get_db()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    user = db.execute('SELECT * FROM users WHERE phone=?', (phone,)).fetchone()
+    if user:
+        db.execute('UPDATE users SET last_login=?, login_count=login_count+1 WHERE id=?', (now, user['id']))
+        db.commit()
+        return dict(user)
+    else:
+        cur = db.execute('INSERT INTO users (phone, created_at, last_login, login_count) VALUES (?,?,?,1)', (phone, now, now))
+        db.commit()
+        return {'id': cur.lastrowid, 'phone': phone, 'created_at': now, 'last_login': now, 'login_count': 1}
+
+
+# ==================== 登录装饰器 ====================
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            if request.is_json or request.path.startswith('/api/'):
+                return jsonify({'error': '请先登录', 'need_login': True}), 401
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ==================== 登录路由 ====================
+
+@app.route('/login')
+def login_page():
+    if 'user_id' in session:
+        return redirect('/')
+    return render_template_string(LOGIN_TEMPLATE)
+
+
+@app.route('/api/send-code', methods=['POST'])
+def api_send_code():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify(success=False, message='请求格式错误'), 400
+    phone = (data.get('phone') or '').strip()
+    if not validate_phone(phone):
+        return jsonify(success=False, message='请输入正确的11位手机号'), 400
+    allowed, wait = check_rate_limit(phone)
+    if not allowed:
+        return jsonify(success=False, message=f'发送太频繁，请{wait}秒后重试'), 429
+    code = ''.join(random.choices(string.digits, k=CODE_LENGTH))
+    success, msg = send_sms_code(phone, code)
+    if not success:
+        if os.environ.get('FLASK_ENV') == 'development':
+            print(f'[开发模式] {phone} 验证码: {code}')
+            db = get_db()
+            now = time.time()
+            db.execute('INSERT INTO verification_codes (phone,code,created_at,expires_at,used) VALUES (?,?,?,?,0)',
+                       (phone, code, now, now + CODE_EXPIRE_MINUTES * 60))
+            db.commit()
+            return jsonify(success=True, message=f'验证码已发送（开发模式: {code}）')
+        return jsonify(success=False, message=msg), 500
+    db = get_db()
+    now = time.time()
+    db.execute('INSERT INTO verification_codes (phone,code,created_at,expires_at,used) VALUES (?,?,?,?,0)',
+               (phone, code, now, now + CODE_EXPIRE_MINUTES * 60))
+    db.commit()
+    return jsonify(success=True, message=f'验证码已发送至 {mask_phone(phone)}，{CODE_EXPIRE_MINUTES}分钟内有效')
+
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify(success=False, message='请求格式错误'), 400
+    phone = (data.get('phone') or '').strip()
+    code = (data.get('code') or '').strip()
+    remember = bool(data.get('remember', False))
+    if not validate_phone(phone):
+        return jsonify(success=False, message='手机号格式错误'), 400
+    if not code or len(code) != CODE_LENGTH:
+        return jsonify(success=False, message=f'请输入{CODE_LENGTH}位验证码'), 400
+    # 校验验证码
+    db = get_db()
+    now = time.time()
+    row = db.execute(
+        'SELECT id, code, expires_at FROM verification_codes WHERE phone=? AND used=0 ORDER BY created_at DESC LIMIT 1',
+        (phone,)
+    ).fetchone()
+    if not row:
+        return jsonify(success=False, message='验证码不存在，请重新获取'), 400
+    if now > row['expires_at']:
+        return jsonify(success=False, message='验证码已过期，请重新获取'), 400
+    if row['code'] != code:
+        return jsonify(success=False, message='验证码错误'), 400
+    db.execute('UPDATE verification_codes SET used=1 WHERE id=?', (row['id'],))
+    db.commit()
+    # 创建/获取用户
+    user = get_or_create_user(phone)
+    # 创建会话
+    session.permanent = True
+    if remember:
+        app.permanent_session_lifetime = timedelta(days=REMEMBER_DAYS)
+    else:
+        app.permanent_session_lifetime = timedelta(days=7)
+    session['user_id'] = user['id']
+    session['phone'] = user['phone']
+    session['login_time'] = datetime.now().isoformat()
+    return jsonify(success=True, message='登录成功', redirect='/')
+
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    session.clear()
+    return jsonify(success=True, message='已退出')
+
+
+@app.route('/api/user-info')
+@login_required
+def api_user_info():
+    db = get_db()
+    user = db.execute('SELECT * FROM users WHERE id=?', (session['user_id'],)).fetchone()
+    if not user:
+        session.clear()
+        return jsonify(error='用户不存在'), 404
+    return jsonify(id=user['id'], phone=mask_phone(user['phone']),
+                   created_at=user['created_at'], login_count=user['login_count'])
+
+
+# ==================== 联网搜索 ====================
+
 def web_search(question, max_results=6):
     """联网搜索法律信息，经过域名白名单和相关性筛选，过滤杂乱信息"""
     if not WEB_SEARCH_AVAILABLE:
         return []
     results = []
     try:
-        # 加上法律相关限定词，提高结果质量
         query = f'{question} 法律 法规 司法解释'
         try:
             raw = list(DDGS().text(query, region='cn-zh', max_results=15))
         except TypeError:
-            # 某些版本不支持region参数
             raw = list(DDGS().text(query, max_results=15))
         for item in raw:
             url = item.get('href', '') or item.get('url', '') or item.get('link', '')
@@ -91,26 +347,15 @@ def web_search(question, max_results=6):
             body = (item.get('body', '') or item.get('snippet', '') or item.get('content', '') or '').strip()
             if not title or not body:
                 continue
-            # 黑名单过滤：直接跳过低质量内容网站（范文/模板/内容农场）
             if any(j in url for j in JUNK_DOMAINS):
                 continue
-            # 域名白名单筛选（只保留可信法律来源）
             is_trusted = any(d in url for d in TRUSTED_LEGAL_DOMAINS)
-            # 相关性筛选：标题或正文需包含法律相关关键词
             legal_kws = ['法', '条例', '规定', '解释', '判决', '案例', '法院', '检察', '条款', '规章']
             is_relevant = any(k in title or k in body for k in legal_kws)
             if not (is_trusted or is_relevant):
                 continue
-            # 是否含具体法条引用（《xx法》或第x条），作为质量信号
             has_cite = bool(re.search(r'《[^》]{2,}》|第[一二三四五六七八九十百零\d]+条', title + body))
-            results.append({
-                'title': title,
-                'body': body[:400],
-                'url': url,
-                'trusted': is_trusted,
-                '_cite': has_cite
-            })
-        # 排序：可信来源优先 > 含具体法条引用优先，再截取前几条
+            results.append({'title': title, 'body': body[:400], 'url': url, 'trusted': is_trusted, '_cite': has_cite})
         results.sort(key=lambda x: (not x['trusted'], not x['_cite']))
         for r in results:
             r.pop('_cite', None)
@@ -127,17 +372,12 @@ def case_search(question, max_results=8):
         return []
     results = []
     try:
-        # 案例专用搜索词：加上典型案例/指导性案例限定
         query = f'{question} 典型案例 最高人民法院 最高人民检察院'
         try:
             raw = list(DDGS().text(query, region='cn-zh', max_results=20))
         except TypeError:
             raw = list(DDGS().text(query, max_results=20))
-        # 案例来源优先级
-        case_domains = [
-            'court.gov.cn', 'spp.gov.cn', 'rmfyalk.court.gov.cn',
-            'wenshu.court.gov.cn', 'pkulaw.com', 'chinalawinfo.com',
-        ]
+        case_domains = ['court.gov.cn', 'spp.gov.cn', 'rmfyalk.court.gov.cn', 'wenshu.court.gov.cn', 'pkulaw.com', 'chinalawinfo.com']
         case_kws = ['典型案例', '指导性案例', '案例', '判决', '裁定', '公诉', '审判']
         for item in raw:
             url = item.get('href', '') or item.get('url', '') or item.get('link', '')
@@ -151,12 +391,7 @@ def case_search(question, max_results=8):
             is_case_related = any(k in title or k in body for k in case_kws)
             if not (is_case_source or is_case_related):
                 continue
-            results.append({
-                'title': title,
-                'body': body[:500],
-                'url': url,
-                'trusted': is_case_source,
-            })
+            results.append({'title': title, 'body': body[:500], 'url': url, 'trusted': is_case_source})
         results.sort(key=lambda x: not x['trusted'])
         results = results[:max_results]
     except Exception as e:
@@ -176,7 +411,6 @@ class LegalDocManager:
     def load_builtin_laws(self):
         """启动时加载全量法律数据"""
         categories = set()
-        # 优先加载压缩数据文件（全量法律库）
         if os.path.isfile(LAWS_DATA_FILE):
             try:
                 with gzip.open(LAWS_DATA_FILE, 'rt', encoding='utf-8') as f:
@@ -195,7 +429,6 @@ class LegalDocManager:
                 print(f'[法律库] 已加载 {self.law_count} 部法律, {self.category_count} 个分类')
             except Exception as e:
                 print(f'[法律库] 加载压缩数据失败: {e}')
-        # 兼容：也加载 laws/ 目录下的 txt 文件
         if os.path.isdir(LAWS_DIR):
             for filepath in glob.glob(os.path.join(LAWS_DIR, '*.txt')):
                 name = os.path.basename(filepath)
@@ -229,7 +462,6 @@ class LegalDocManager:
         return result
 
     def get_stats(self):
-        """返回法律库统计信息"""
         cats = {}
         for name in self.documents:
             if name.startswith('upload_'):
@@ -323,7 +555,6 @@ class LegalDocManager:
         asked_nums = set()
         for m in re.finditer(r'第([零一二三四五六七八九十百千\d]+)条', question):
             asked_nums.add(self._cn2int(m.group(1)))
-        # 提取问题中提到的法律名称
         law_names = set()
         for m in re.finditer(r'《(.+?)》', question):
             law_names.add(m.group(1))
@@ -339,7 +570,6 @@ class LegalDocManager:
                 cn = self._cn2int(chunk['article_num'])
                 if cn in asked_nums:
                     score += 50
-            # 法律名称匹配加分
             if law_names:
                 src = chunk['source']
                 for ln in law_names:
@@ -351,7 +581,6 @@ class LegalDocManager:
         return [c for _, c in scored[:top_n]]
 
     def search_only(self, question):
-        """纯库搜索模式，不调用AI，不消耗tokens"""
         results = self.search(question, top_n=8)
         if not self.chunks:
             return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
@@ -373,13 +602,10 @@ class LegalDocManager:
         return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'ai_used': False}
 
     def search_cases_only(self, question):
-        """纯案例搜索模式，不调用AI，不消耗tokens"""
-        # 搜索库内案例
         local_results = self.search(question, top_n=6)
         case_results = [c for c in local_results if '案例' in c['source']]
         other_results = [c for c in local_results if '案例' not in c['source']]
         local_case = (case_results + other_results)[:5]
-        # 联网搜索两高典型案例
         web_cases = case_search(question)
         if not local_case and not web_cases:
             return {'answer': '未找到相关典型案例。建议换一种方式提问，或前往人民法院案例库（rmfyalk.court.gov.cn）检索。',
@@ -396,28 +622,17 @@ class LegalDocManager:
         if web_cases:
             parts.append(f"\n【两高典型案例（联网搜索）】共 {len(web_cases)} 条：\n")
             for wc in web_cases:
-                src_tag = '★官方' if wc['trusted'] else ''
-                parts.append(f"● {wc['title']} {src_tag}\n  {wc['body'][:200]}")
+                parts.append(f"● {wc['title']} {('[官方来源]' if wc['trusted'] else '')}\n  {wc['body'][:200]}")
                 web_citations.append({'title': wc['title'][:35], 'source': '案例搜索', 'url': wc['url']})
         return {'answer': '\n\n'.join(parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
     def answer_with_ai(self, question, history=None, use_web=False, use_case=False):
-        """搜索法条 + DeepSeek 智能回答（支持上下文、联网搜索和案例搜索）"""
         results = self.search(question)
-
-        # 联网搜索（经过筛选）
-        web_results = []
-        if use_web:
-            web_results = web_search(question)
-
-        # 案例搜索（专门搜两高典型案例）
-        case_results = []
-        if use_case:
-            case_results = case_search(question)
+        web_results = web_search(question) if use_web else []
+        case_results = case_search(question) if use_case else []
 
         if not self.chunks and not web_results and not case_results:
             return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
-
         if not results and not web_results and not case_results:
             if DEEPSEEK_API_KEY:
                 ai_answer = self._call_deepseek(question, '', history)
@@ -426,7 +641,6 @@ class LegalDocManager:
             return {'answer': '抱歉，没有找到相关法律条文。建议换一种方式提问，或上传更多法律文件。',
                     'citations': [], 'ai_used': False}
 
-        # 构建法条上下文
         context_parts = []
         citations = []
         for chunk in results:
@@ -434,14 +648,12 @@ class LegalDocManager:
             context_parts.append(f"【{chunk['title']}】（{src_display}）\n{chunk['content']}")
             citations.append({'title': chunk['title'], 'source': src_display})
 
-        # 追加联网搜索结果（已筛选）
         web_citations = []
         if web_results:
             context_parts.append('=== 以下为联网搜索到的权威法律信息（已筛选） ===')
             for wr in web_results:
                 context_parts.append(f"【网络资料】{wr['title']}\n{wr['body']}")
                 web_citations.append({'title': wr['title'][:30], 'source': '联网搜索', 'url': wr['url']})
-        # 追加案例搜索结果（两高典型案例）
         if case_results:
             context_parts.append('=== 以下为搜索到的两高典型案例（已筛选） ===')
             for cr in case_results:
@@ -449,13 +661,11 @@ class LegalDocManager:
                 web_citations.append({'title': cr['title'][:35], 'source': '案例搜索', 'url': cr['url']})
         context = '\n\n'.join(context_parts)
 
-        # 调用 DeepSeek
         if DEEPSEEK_API_KEY:
             ai_answer = self._call_deepseek(question, context, history, has_web=bool(web_results), case_mode=bool(case_results))
             if ai_answer:
                 return {'answer': ai_answer, 'citations': citations, 'web_citations': web_citations, 'ai_used': True}
 
-        # AI 不可用时的降级方案
         kw_str = '、'.join(self._keywords(question)[:6])
         header = f"找到以下 {len(results)} 条相关法条"
         if kw_str:
@@ -469,7 +679,6 @@ class LegalDocManager:
         return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
     def _call_deepseek(self, question, context, history=None, has_web=False, case_mode=False):
-        """调用 DeepSeek API（支持多轮对话上下文、联网搜索和案例模式）"""
         if case_mode:
             system_prompt = (
                 '你是一位专业的中国法律案例分析专家，名叫"法小智"。你精通最高人民法院和最高人民检察院发布的'
@@ -508,7 +717,6 @@ class LegalDocManager:
         else:
             user_msg = f'用户问题：{question}\n\n（未找到直接相关的法条，请根据你的法律知识回答，并注明仅供参考）'
         messages = [{'role': 'system', 'content': system_prompt}]
-        # 加入历史对话（最多保留最近6轮，控制token消耗）
         if history:
             for h in history[-12:]:
                 if h.get('role') in ('user', 'assistant') and h.get('content'):
@@ -518,12 +726,7 @@ class LegalDocManager:
             resp = http_requests.post(
                 DEEPSEEK_URL,
                 headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {DEEPSEEK_API_KEY}'},
-                json={
-                    'model': DEEPSEEK_MODEL,
-                    'messages': messages,
-                    'temperature': 0.3,
-                    'max_tokens': 2000,
-                },
+                json={'model': DEEPSEEK_MODEL, 'messages': messages, 'temperature': 0.3, 'max_tokens': 2000},
                 timeout=60
             )
             data = resp.json()
@@ -564,7 +767,8 @@ def extract_text(file_storage, filename):
 def health():
     return jsonify(status='ok', docs=len(dm.documents), chunks=len(dm.chunks),
                    laws=dm.law_count, categories=dm.category_count,
-                   ai='deepseek' if DEEPSEEK_API_KEY else 'off')
+                   ai='deepseek' if DEEPSEEK_API_KEY else 'off',
+                   sms=SMS_AVAILABLE)
 
 @app.route('/api/stats')
 def stats():
@@ -572,7 +776,6 @@ def stats():
 
 @app.route('/api/websearch_debug')
 def websearch_debug():
-    """调试端点：诊断联网搜索在当前服务器环境是否可用（不消耗tokens）"""
     info = {'available': WEB_SEARCH_AVAILABLE, 'backend': 'none'}
     if DDGS is not None:
         info['backend'] = getattr(DDGS, '__module__', 'unknown')
@@ -586,6 +789,7 @@ def websearch_debug():
     return jsonify(info)
 
 @app.route('/api/upload', methods=['POST'])
+@login_required
 def upload():
     f = request.files.get('file')
     if not f or not f.filename:
@@ -608,15 +812,18 @@ def upload():
         return jsonify(error=f'上传失败：{e}'), 500
 
 @app.route('/api/documents', methods=['GET'])
+@login_required
 def list_docs():
     return jsonify(documents=dm.get_doc_list())
 
 @app.route('/api/documents/<path:filename>', methods=['DELETE'])
+@login_required
 def delete_doc(filename):
     dm.remove_document(filename)
     return jsonify(success=True)
 
 @app.route('/api/chat', methods=['POST'])
+@login_required
 def chat():
     data = request.get_json(silent=True)
     if not data or not (data.get('question') or '').strip():
@@ -636,12 +843,12 @@ def chat():
     return jsonify(result)
 
 @app.route('/api/article', methods=['GET'])
+@login_required
 def get_article():
     source = request.args.get('source', '')
     title = request.args.get('title', '')
     if not source or not title:
         return jsonify(error='缺少参数'), 400
-    # 在chunks中查找匹配的法条
     for chunk in dm.chunks:
         src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
         if chunk['title'] == title and (src_display == source or source in chunk['source']):
@@ -650,9 +857,109 @@ def get_article():
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    if 'user_id' not in session:
+        return redirect('/login')
+    return render_template_string(HTML_TEMPLATE, phone=mask_phone(session.get('phone', '')))
 
-# ==================== 前端 ====================
+# ==================== 登录页模板 ====================
+LOGIN_TEMPLATE = r'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 - 法律问答助手</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:linear-gradient(135deg,#1a365d 0%,#2c5282 50%,#2b6cb0 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.login-card{background:#fff;border-radius:16px;padding:44px 38px;width:100%;max-width:400px;box-shadow:0 20px 60px rgba(0,0,0,.25)}
+.login-header{text-align:center;margin-bottom:32px}
+.login-header .icon{font-size:48px;margin-bottom:12px}
+.login-header h1{font-size:22px;color:#1a365d;margin-bottom:6px}
+.login-header p{font-size:14px;color:#666}
+.form-group{margin-bottom:18px}
+.form-group label{display:block;font-size:14px;color:#333;margin-bottom:7px;font-weight:500}
+.input-row{display:flex;gap:10px}
+.form-group input[type=tel],.form-group input[type=text]{width:100%;padding:12px 14px;border:2px solid #e2e8f0;border-radius:10px;font-size:16px;outline:none;transition:border-color .2s}
+.form-group input:focus{border-color:#4299e1}
+.input-row input{flex:1}
+.btn-code{flex-shrink:0;padding:12px 18px;background:#2c5282;color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;transition:background .2s;white-space:nowrap}
+.btn-code:hover:not(:disabled){background:#1a365d}
+.btn-code:disabled{opacity:.6;cursor:not-allowed;background:#718096}
+.remember-row{display:flex;align-items:center;gap:8px;margin:14px 0;font-size:14px;color:#4a5568;cursor:pointer;user-select:none}
+.remember-row input{width:16px;height:16px;cursor:pointer}
+.btn-login{width:100%;padding:14px;background:linear-gradient(135deg,#2c5282,#2b6cb0);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;transition:transform .15s,box-shadow .15s}
+.btn-login:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 20px rgba(44,82,130,.4)}
+.btn-login:disabled{opacity:.7;cursor:not-allowed;transform:none}
+.msg{margin-top:14px;padding:11px 14px;border-radius:8px;font-size:13px;display:none}
+.msg.error{display:block;background:#fff5f5;border:1px solid #fed7d7;color:#c53030}
+.msg.success{display:block;background:#f0fff4;border:1px solid #c6f6d5;color:#276749}
+.login-footer{text-align:center;margin-top:20px;font-size:12px;color:#a0aec0}
+.loading{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-radius:50%;border-top-color:#fff;animation:spin .7s linear infinite;vertical-align:middle;margin-right:5px}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="login-header">
+    <div class="icon">&#9878;</div>
+    <h1>法律问答助手</h1>
+    <p>手机号验证码登录 · 4868部法律法规 · AI智能解答</p>
+  </div>
+  <form onsubmit="return false">
+    <div class="form-group">
+      <label>手机号</label>
+      <input type="tel" id="phone" placeholder="请输入11位手机号" maxlength="11" inputmode="numeric" autocomplete="tel">
+    </div>
+    <div class="form-group">
+      <label>验证码</label>
+      <div class="input-row">
+        <input type="text" id="code" placeholder="6位验证码" maxlength="6" inputmode="numeric" autocomplete="one-time-code">
+        <button type="button" class="btn-code" id="btnCode" onclick="sendCode()">获取验证码</button>
+      </div>
+    </div>
+    <label class="remember-row"><input type="checkbox" id="remember" checked> 记住我（30天内免登录）</label>
+    <button type="submit" class="btn-login" id="btnLogin" onclick="doLogin()">登 录</button>
+  </form>
+  <div id="msg" class="msg"></div>
+  <div class="login-footer">未注册的手机号验证后将自动创建账号</div>
+</div>
+<script>
+let cd=0,tm=null;
+document.getElementById('phone').oninput=function(){this.value=this.value.replace(/\D/g,'')};
+document.getElementById('code').oninput=function(){this.value=this.value.replace(/\D/g,'')};
+document.getElementById('phone').onkeydown=function(e){if(e.key==='Enter')sendCode()};
+document.getElementById('code').onkeydown=function(e){if(e.key==='Enter')doLogin()};
+function showMsg(t,type){const el=document.getElementById('msg');el.textContent=t;el.className='msg '+type}
+function hideMsg(){document.getElementById('msg').className='msg'}
+function startCd(s){cd=s;const b=document.getElementById('btnCode');b.disabled=true;b.textContent=cd+'s';tm=setInterval(()=>{cd--;if(cd<=0){clearInterval(tm);b.disabled=false;b.textContent='获取验证码'}else b.textContent=cd+'s'},1000)}
+async function sendCode(){
+  const p=document.getElementById('phone').value.trim();
+  if(!/^1[3-9]\d{9}$/.test(p)){showMsg('请输入正确的11位手机号','error');return}
+  hideMsg();const b=document.getElementById('btnCode');b.disabled=true;b.innerHTML='<span class="loading"></span>';
+  try{
+    const r=await fetch('/api/send-code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:p})});
+    const d=await r.json();
+    if(d.success){showMsg(d.message,'success');startCd(60);document.getElementById('code').focus()}
+    else{showMsg(d.message,'error');b.disabled=false;b.textContent='获取验证码'}
+  }catch{showMsg('网络错误','error');b.disabled=false;b.textContent='获取验证码'}
+}
+async function doLogin(){
+  const p=document.getElementById('phone').value.trim(),c=document.getElementById('code').value.trim();
+  if(!/^1[3-9]\d{9}$/.test(p)){showMsg('请输入正确的手机号','error');return}
+  if(!/^\d{6}$/.test(c)){showMsg('请输入6位验证码','error');return}
+  hideMsg();const b=document.getElementById('btnLogin');b.disabled=true;b.innerHTML='<span class="loading"></span>登录中...';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:p,code:c,remember:document.getElementById('remember').checked})});
+    const d=await r.json();
+    if(d.success){showMsg('登录成功，正在进入...','success');setTimeout(()=>location.href='/',600)}
+    else{showMsg(d.message,'error');b.disabled=false;b.textContent='登 录'}
+  }catch{showMsg('网络错误','error');b.disabled=false;b.textContent='登 录'}
+}
+</script>
+</body>
+</html>'''
+
+# ==================== 主界面模板 ====================
 HTML_TEMPLATE = r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -667,6 +974,10 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .header h1{font-size:22px;font-weight:600;letter-spacing:2px}
   .header .sub{font-size:13px;opacity:.7;margin-left:8px}
   .header .badge{margin-left:auto;background:rgba(255,255,255,.15);padding:4px 14px;border-radius:20px;font-size:12px}
+  .header .user-box{display:flex;align-items:center;gap:10px;margin-left:12px}
+  .header .user-phone{font-size:13px;opacity:.9}
+  .header .btn-out{background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;padding:4px 12px;border-radius:6px;font-size:12px;cursor:pointer;transition:background .2s}
+  .header .btn-out:hover{background:rgba(255,255,255,.25)}
   .main{flex:1;display:flex;overflow:hidden}
   .sidebar{width:300px;background:#fff;border-right:1px solid #e2e8f0;display:flex;flex-direction:column;flex-shrink:0}
   .sidebar-title{padding:18px 20px 10px;font-size:16px;font-weight:600;color:#2d3748}
@@ -689,7 +1000,6 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .doc-item .info{flex:1;min-width:0}
   .doc-item .dn{font-size:13px;font-weight:500;color:#2d3748;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .doc-item .dm{font-size:11px;color:#a0aec0}
-  .doc-item .tag{font-size:10px;background:#ebf8ff;color:#2b6cb0;padding:1px 6px;border-radius:8px;margin-left:4px}
   .doc-item .dd{background:none;border:none;font-size:16px;color:#e53e3e;cursor:pointer;padding:4px 8px;border-radius:6px}
   .doc-item .dd:hover{background:#fff5f5}
   .flk-link{margin:8px 16px 12px;padding:10px;background:#f0fff4;border-radius:10px;text-align:center}
@@ -720,7 +1030,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .typing-indicator span:nth-child(3){animation-delay:.4s}
   @keyframes bounce{0%,80%,100%{transform:scale(.6);opacity:.4}40%{transform:scale(1);opacity:1}}
   .citation-tags{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
-  .citation-tag{background:#ebf8ff;color:#2b6cb0;font-size:11px;padding:3px 10px;border-radius:12px;cursor:pointer;transition:all .15s;border:1px solid transparent}
+  .citation-tag{background:#ebf8ff;color:#2b6cb0;font-size:11px;padding:3px 10px;border-radius:12px;cursor:pointer;transition:all .15s;border:1px solid transparent;text-decoration:none}
   .citation-tag:hover{background:#bee3f8;border-color:#4299e1;text-decoration:underline}
   .input-area{padding:16px 32px 20px;background:#fff;border-top:1px solid #e2e8f0;display:flex;gap:12px;align-items:flex-end}
   .input-area textarea{flex:1;border:2px solid #e2e8f0;border-radius:12px;padding:12px 16px;font-size:14px;font-family:inherit;resize:none;outline:none;max-height:120px;line-height:1.5;transition:border-color .15s}
@@ -742,7 +1052,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   ::-webkit-scrollbar{width:6px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:#cbd5e0;border-radius:3px}
-  @media(max-width:768px){.sidebar{width:100%;max-height:35vh;border-right:none;border-bottom:1px solid #e2e8f0}.main{flex-direction:column}.messages{padding:16px}.input-area{padding:12px 16px}.msg-bubble{max-width:88%}}
+  @media(max-width:768px){.sidebar{width:100%;max-height:35vh;border-right:none;border-bottom:1px solid #e2e8f0}.main{flex-direction:column}.messages{padding:16px}.input-area{padding:12px 16px}.msg-bubble{max-width:88%}.header .sub{display:none}}
 </style>
 </head>
 <body>
@@ -750,7 +1060,11 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   <span class="icon">&#9878;</span>
   <h1>法律问答助手</h1>
   <span class="sub">DeepSeek AI · 4868部法律法规 + 司法解释 + 典型案例</span>
-  <span class="badge">全量法律库 v4.5</span>
+  <span class="badge">全量法律库 v5.0</span>
+  <div class="user-box">
+    <span class="user-phone">&#128100; {{ phone }}</span>
+    <button class="btn-out" onclick="logout()">退出</button>
+  </div>
 </div>
 <div class="main">
   <div class="sidebar">
@@ -803,37 +1117,13 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   </div>
 </div>
 <script>
-let busy=false;
-let chatMode='ai';
-let abortCtrl=null;
-let chatHistory=[];
-let useWeb=false;
-let useCase=false;
-function toggleWeb(){
-  useWeb=!useWeb;
-  const wb=document.getElementById('modeWeb');
-  wb.className=useWeb?'mt-label active-web':'mt-label';
-}
-function toggleCase(){
-  useCase=!useCase;
-  const cb=document.getElementById('modeCase');
-  cb.className=useCase?'mt-label active-case':'mt-label';
-}
-function setMode(m){
-  chatMode=m;
-  const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),hint=document.getElementById('modeHint');
-  ai.className='mt-label';se.className='mt-label';
-  if(m==='ai'){ai.className='mt-label active';hint.textContent='AI回答更精准，消耗tokens'}
-  else{se.className='mt-label active-search';hint.textContent='直接搜索法律库，免费不消耗tokens'}
-}
-function setBtnStop(isStop){
-  const b=document.getElementById('sendBtn');
-  if(isStop){b.textContent='⏹ 停止';b.className='send-btn stop';b.onclick=cancelSend}
-  else{b.textContent='发送提问';b.className='send-btn';b.onclick=send}
-}
-function cancelSend(){
-  if(abortCtrl){abortCtrl.abort();abortCtrl=null}
-}
+let busy=false,chatMode='ai',abortCtrl=null,chatHistory=[],useWeb=false,useCase=false;
+function toggleWeb(){useWeb=!useWeb;document.getElementById('modeWeb').className=useWeb?'mt-label active-web':'mt-label'}
+function toggleCase(){useCase=!useCase;document.getElementById('modeCase').className=useCase?'mt-label active-case':'mt-label'}
+function setMode(m){chatMode=m;const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),hint=document.getElementById('modeHint');ai.className='mt-label';se.className='mt-label';if(m==='ai'){ai.className='mt-label active';hint.textContent='AI回答更精准，消耗tokens'}else{se.className='mt-label active-search';hint.textContent='直接搜索法律库，免费不消耗tokens'}}
+function setBtnStop(s){const b=document.getElementById('sendBtn');if(s){b.textContent='\u23F9 停止';b.className='send-btn stop';b.onclick=cancelSend}else{b.textContent='发送提问';b.className='send-btn';b.onclick=send}}
+function cancelSend(){if(abortCtrl){abortCtrl.abort();abortCtrl=null}}
+async function logout(){try{await fetch('/api/logout',{method:'POST'})}catch{};location.href='/login'}
 window.addEventListener('DOMContentLoaded',()=>{loadDocs();loadStats();ar()});
 const fi=document.getElementById('fileInput'),uz=document.getElementById('uploadZone'),us=document.getElementById('uploadStatus');
 fi.addEventListener('change',e=>{if(e.target.files.length)upAll(e.target.files)});
@@ -841,31 +1131,11 @@ uz.addEventListener('dragover',e=>{e.preventDefault();uz.classList.add('dragover
 uz.addEventListener('dragleave',()=>uz.classList.remove('dragover'));
 uz.addEventListener('drop',e=>{e.preventDefault();uz.classList.remove('dragover');if(e.dataTransfer.files.length)upAll(e.dataTransfer.files)});
 async function upAll(files){for(const f of files)await upOne(f);fi.value='';loadDocs()}
-async function upOne(file){
-  ss('loading','正在上传 "'+file.name+'"…');
-  const fd=new FormData();fd.append('file',file);
-  try{const r=await fetch('/api/upload',{method:'POST',body:fd});const d=await r.json();
-    if(r.ok&&d.success)ss('success',d.message);else ss('error',d.error||'上传失败')}
-  catch{ss('error','网络错误')}
-}
+async function upOne(file){ss('loading','正在上传 "'+file.name+'"…');const fd=new FormData();fd.append('file',file);try{const r=await fetch('/api/upload',{method:'POST',body:fd});const d=await r.json();if(r.ok&&d.success)ss('success',d.message);else ss('error',d.error||'上传失败')}catch{ss('error','网络错误')}}
 function ss(t,m){us.className='upload-status '+t;us.textContent=m;if(t==='success')setTimeout(()=>us.className='upload-status',5000)}
-async function loadStats(){
-  try{const r=await fetch('/api/stats');const d=await r.json();
-    const cats=Object.entries(d.categories||{}).sort((a,b)=>b[1]-a[1]).slice(0,6).map(e=>e[0]).join('、');
-    document.getElementById('statsBar').innerHTML='<b>'+d.total+'</b> 部法律法规 · <b>'+d.chunks.toLocaleString()+'</b> 个条文<br>涵盖：'+cats+' 等';
-  }catch{document.getElementById('statsBar').textContent='法律库已就绪'}
-}
-async function loadDocs(){try{const r=await fetch('/api/documents');const d=await r.json();rdl(d.documents)}catch{}}
-function rdl(docs){
-  const el=document.getElementById('docList');
-  const uploads=docs.filter(d=>!d.builtin);
-  if(!uploads.length){el.innerHTML='<div style="text-align:center;padding:16px;color:#a0aec0;font-size:13px">内置法律库已包含全部法律法规<br>如需补充可上传文件</div>';return}
-  el.innerHTML='<div style="padding:4px 0 8px;font-size:12px;color:#718096">用户上传 ('+uploads.length+')</div>'+uploads.map(d=>{
-    const icon=d.name.endsWith('.pdf')?'&#128211;':'&#128196;';
-    const displayName=d.name.replace(/^upload_/,'');
-    return `<div class="doc-item"><span class="di">${icon}</span><div class="info"><div class="dn" title="${displayName}">${displayName}</div><div class="dm">${d.articles>0?d.articles+' 条法条':d.chunks+' 个段落'}</div></div><button class="dd" onclick="dd('${d.name}')" title="删除">&#10005;</button></div>`
-  }).join('')
-}
+async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const cats=Object.entries(d.categories||{}).sort((a,b)=>b[1]-a[1]).slice(0,6).map(e=>e[0]).join('、');document.getElementById('statsBar').innerHTML='<b>'+d.total+'</b> 部法律法规 · <b>'+d.chunks.toLocaleString()+'</b> 个条文<br>涵盖：'+cats+' 等'}catch{document.getElementById('statsBar').textContent='法律库已就绪'}}
+async function loadDocs(){try{const r=await fetch('/api/documents');if(r.status===401){location.href='/login';return}const d=await r.json();rdl(d.documents)}catch{}}
+function rdl(docs){const el=document.getElementById('docList');const uploads=docs.filter(d=>!d.builtin);if(!uploads.length){el.innerHTML='<div style="text-align:center;padding:16px;color:#a0aec0;font-size:13px">内置法律库已包含全部法律法规<br>如需补充可上传文件</div>';return}el.innerHTML='<div style="padding:4px 0 8px;font-size:12px;color:#718096">用户上传 ('+uploads.length+')</div>'+uploads.map(d=>{const icon=d.name.endsWith('.pdf')?'&#128211;':'&#128196;';const dn=d.name.replace(/^upload_/,'');return `<div class="doc-item"><span class="di">${icon}</span><div class="info"><div class="dn" title="${dn}">${dn}</div><div class="dm">${d.articles>0?d.articles+' 条法条':d.chunks+' 个段落'}</div></div><button class="dd" onclick="dd('${d.name}')" title="删除">&#10005;</button></div>`}).join('')}
 async function dd(n){if(!confirm('确定删除吗？'))return;try{await fetch('/api/documents/'+encodeURIComponent(n),{method:'DELETE'});loadDocs()}catch{alert('删除失败')}}
 function fill(t){document.getElementById('qInput').value=t;document.getElementById('qInput').focus()}
 function hk(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}}
@@ -876,11 +1146,12 @@ async function send(){
   addMsg('user',q);inp.value='';inp.style.height='auto';
   chatHistory.push({role:'user',content:q});
   busy=true;setBtnStop(true);abortCtrl=new AbortController();const ld=addTyping();
-  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode,history:chatHistory.slice(0,-1),use_web:useWeb,use_case:useCase}),signal:abortCtrl.signal});const d=await r.json();
-    ld.remove();
+  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,mode:chatMode,history:chatHistory.slice(0,-1),use_web:useWeb,use_case:useCase}),signal:abortCtrl.signal});
+    if(r.status===401){ld.remove();location.href='/login';return}
+    const d=await r.json();ld.remove();
     if(d.answer){addMsg('bot',d.answer,d.citations,d.ai_used,d.web_citations);chatHistory.push({role:'assistant',content:d.answer})}
     else if(d.error)addMsg('bot','错误：'+d.error)}
-  catch(e){ld.remove();if(e.name==='AbortError'){addMsg('bot','⏹ 已取消提问，未消耗tokens。',[],false);chatHistory.pop()}else addMsg('bot','网络错误，请稍后再试。')}
+  catch(e){ld.remove();if(e.name==='AbortError'){addMsg('bot','\u23F9 已取消提问，未消耗tokens。',[],false);chatHistory.pop()}else addMsg('bot','网络错误，请稍后再试。')}
   busy=false;abortCtrl=null;setBtnStop(false)
 }
 function addMsg(role,text,cites,aiUsed,webCites){
@@ -888,30 +1159,16 @@ function addMsg(role,text,cites,aiUsed,webCites){
   const av=role==='user'?'&#128100;':'&#9878;';
   let aiBadge=(aiUsed&&role==='bot')?'<div class="ai-badge">&#129302; DeepSeek AI 回答</div>':'';
   let ch='';if(cites&&cites.length)ch='<div class="citation-tags">'+cites.map(c=>'<span class="citation-tag" onclick="showArticle(\''+esc(c.title).replace(/'/g,"\\'")+'\',\''+esc(c.source).replace(/'/g,"\\'")+'\')" title="点击查看原文">'+esc(c.title+' · '+c.source.replace(/^upload_/,''))+'</span>').join('')+'</div>';
-  let wch='';if(webCites&&webCites.length)wch='<div class="citation-tags">'+webCites.map(w=>'<a class="citation-tag web-cite" href="'+esc(w.url)+'" target="_blank" title="'+esc(w.url)+'">&#127760; '+esc(w.title)+'</a>').join('')+'</div>';
+  let wch='';if(webCites&&webCites.length)wch='<div class="citation-tags">'+webCites.map(w=>'<a class="citation-tag" href="'+esc(w.url)+'" target="_blank" title="'+esc(w.url)+'">&#127760; '+esc(w.title)+'</a>').join('')+'</div>';
   r.innerHTML=(role==='user'?'':'<div class="msg-avatar">'+av+'</div>')+'<div class="msg-bubble">'+aiBadge+esc(text)+ch+wch+'</div>'+(role==='user'?'<div class="msg-avatar">'+av+'</div>':'');
   c.appendChild(r);c.scrollTop=c.scrollHeight
 }
-function addTyping(){
-  const c=document.getElementById('messages'),r=document.createElement('div');r.className='msg-row bot';
-  r.innerHTML='<div class="msg-avatar">&#9878;</div><div class="msg-bubble typing-indicator"><span></span><span></span><span></span></div>';
-  c.appendChild(r);c.scrollTop=c.scrollHeight;return r
-}
+function addTyping(){const c=document.getElementById('messages'),r=document.createElement('div');r.className='msg-row bot';r.innerHTML='<div class="msg-avatar">&#9878;</div><div class="msg-bubble typing-indicator"><span></span><span></span><span></span></div>';c.appendChild(r);c.scrollTop=c.scrollHeight;return r}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 async function showArticle(title,source){
-  if(busy)return;
-  busy=true;
-  const ld=addTyping();
-  try{
-    const r=await fetch('/api/article?title='+encodeURIComponent(title)+'&source='+encodeURIComponent(source));
-    const d=await r.json();
-    ld.remove();
-    if(d.found){
-      addMsg('bot','📜 '+d.title+'（'+d.source+'）\n\n'+d.content,[],false);
-    }else{
-      addMsg('bot','抱歉，未能找到该条文原文。',[],false);
-    }
-  }catch{ld.remove();addMsg('bot','网络错误，请稍后再试。',[],false)}
+  if(busy)return;busy=true;const ld=addTyping();
+  try{const r=await fetch('/api/article?title='+encodeURIComponent(title)+'&source='+encodeURIComponent(source));const d=await r.json();ld.remove();if(d.found)addMsg('bot','\uD83D\uDCDC '+d.title+'（'+d.source+'）\n\n'+d.content,[],false);else addMsg('bot','抱歉，未能找到该条文原文。',[],false)}
+  catch{ld.remove();addMsg('bot','网络错误，请稍后再试。',[],false)}
   busy=false;
 }
 </script>
@@ -919,13 +1176,16 @@ async function showArticle(title,source){
 </html>'''
 
 # ==================== 启动 ====================
+init_db()
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print()
     print('=' * 50)
-    print('    法律问答助手 v4.5 (全量法律库 + AI + 案例搜索)')
+    print('    法律问答助手 v5.0 (全量法律库 + AI + 案例搜索 + 登录)')
     print(f'    内置法律: {dm.law_count} 部, {len(dm.chunks)} 个条文')
     print(f'    AI 引擎:  {"DeepSeek" if DEEPSEEK_API_KEY else "未配置"}')
+    print(f'    短信服务: {"腾讯云SMS" if SMS_AVAILABLE else "未安装(开发模式)"}')
     print(f'    访问:     http://127.0.0.1:{port}')
     print('=' * 50)
     app.run(host='0.0.0.0', port=port, debug=False)

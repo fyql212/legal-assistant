@@ -59,6 +59,15 @@ TRUSTED_LEGAL_DOMAINS = [
     '12309.gov.cn',      # 中国检察网
     'ts.12348.gov.cn',   # 中国法律服务网
 ]
+
+# 低质量网站黑名单（范文/模板/内容农场/自媒体，内容不可靠，直接过滤）
+JUNK_DOMAINS = [
+    'yjbys.com', 'ruiwen.com', 'pincai.com', 'oh100.com', 'unjs.com',
+    'wenku.baidu.com', 'zhidao.baidu.com', 'baijiahao.baidu.com',
+    'jianshu.com', 'sohu.com', '163.com', 'toutiao.com', 'qq.com',
+    'docin.com', 'doc88.com', 'book118.com', 'csdn.net', 'cnrencai.com',
+    'yuedu.baidu.com', 'max.book118.com',
+]
 LAWS_DIR = os.path.join(BASE_DIR, 'laws')
 
 
@@ -81,6 +90,9 @@ def web_search(question, max_results=6):
             body = (item.get('body', '') or item.get('snippet', '') or item.get('content', '') or '').strip()
             if not title or not body:
                 continue
+            # 黑名单过滤：直接跳过低质量内容网站（范文/模板/内容农场）
+            if any(j in url for j in JUNK_DOMAINS):
+                continue
             # 域名白名单筛选（只保留可信法律来源）
             is_trusted = any(d in url for d in TRUSTED_LEGAL_DOMAINS)
             # 相关性筛选：标题或正文需包含法律相关关键词
@@ -88,17 +100,20 @@ def web_search(question, max_results=6):
             is_relevant = any(k in title or k in body for k in legal_kws)
             if not (is_trusted or is_relevant):
                 continue
-            # 优先可信来源
+            # 是否含具体法条引用（《xx法》或第x条），作为质量信号
+            has_cite = bool(re.search(r'《[^》]{2,}》|第[一二三四五六七八九十百零\d]+条', title + body))
             results.append({
                 'title': title,
                 'body': body[:400],
                 'url': url,
-                'trusted': is_trusted
+                'trusted': is_trusted,
+                '_cite': has_cite
             })
-            if len(results) >= max_results:
-                break
-        # 可信来源排在前面
-        results.sort(key=lambda x: (not x['trusted']))
+        # 排序：可信来源优先 > 含具体法条引用优先，再截取前几条
+        results.sort(key=lambda x: (not x['trusted'], not x['_cite']))
+        for r in results:
+            r.pop('_cite', None)
+        results = results[:max_results]
     except Exception as e:
         print(f'[联网搜索] 失败: {e}')
         return []

@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════╗
-║   法律问答助手 v5.0 — 全量法律库 + AI + 案例搜索     ║
+║   法律问答助手 v5.1 — 全量法律库 + AI + 案例搜索     ║
 ║                                                      ║
 ║  内置法律库：4868部法律法规 + 司法解释 + 典型案例     ║
 ║  AI 引擎：  DeepSeek 大模型智能回答                   ║
 ║  特色功能：联网搜索 · 两高典型案例检索                ║
-║  用户系统：手机号验证码登录 · 记住我                  ║
+║  用户系统：用户名密码登录 · 注册 · 记住我             ║
 ║  部署平台：Railway.com                                ║
 ╚══════════════════════════════════════════════════════╝
 """
@@ -16,9 +16,6 @@ import re
 import json
 import gzip
 import glob
-import time
-import random
-import string
 import sqlite3
 import secrets
 from datetime import datetime, timedelta
@@ -26,6 +23,7 @@ from functools import wraps
 
 import requests as http_requests
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, g
+from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
     import jieba
@@ -46,17 +44,6 @@ except ImportError:
     except ImportError:
         WEB_SEARCH_AVAILABLE = False
 
-# 腾讯云短信SDK
-SMS_AVAILABLE = False
-try:
-    from tencentcloud.common import credential
-    from tencentcloud.common.profile.client_profile import ClientProfile
-    from tencentcloud.common.profile.http_profile import HttpProfile
-    from tencentcloud.sms.v20210111 import sms_client, models as sms_models
-    SMS_AVAILABLE = True
-except ImportError:
-    pass
-
 # ==================== 配置 ====================
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024
@@ -71,32 +58,39 @@ DEEPSEEK_MODEL = 'deepseek-v4-flash'
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LAWS_DATA_FILE = os.path.join(BASE_DIR, 'laws_data.json.gz')
 
-# 腾讯云短信配置（环境变量）
-TENCENT_SECRET_ID = os.environ.get('TENCENT_SECRET_ID', '')
-TENCENT_SECRET_KEY = os.environ.get('TENCENT_SECRET_KEY', '')
-SMS_SDK_APP_ID = os.environ.get('SMS_SDK_APP_ID', '')
-SMS_SIGN_NAME = os.environ.get('SMS_SIGN_NAME', '')
-SMS_TEMPLATE_ID = os.environ.get('SMS_TEMPLATE_ID', '')
-
 # 用户数据库
 DB_PATH = os.environ.get('DB_PATH', os.path.join(BASE_DIR, 'users.db'))
-CODE_EXPIRE_MINUTES = 5
-CODE_RESEND_SECONDS = 60
-CODE_LENGTH = 6
 REMEMBER_DAYS = 30  # "记住我"会话时长
+
+# 开发者账户（仅此账户可上传法律文件）
+DEV_USERNAME = 'fyql'
+DEV_PASSWORD = 'Zbl20080212'
 
 # 联网搜索可信法律域名白名单（用于筛选，过滤杂乱信息）
 TRUSTED_LEGAL_DOMAINS = [
     'court.gov.cn',      # 最高人民法院
     'spp.gov.cn',        # 最高人民检察院
     'npc.gov.cn',        # 全国人大
-    'gov.cn',            # 各级政府
+    'gov.cn',            # 各级政府（含地方法规）
     'pkulaw.com',        # 北大法宝
     'chinalaw.gov.cn',   # 司法部
     'rmfyalk.court.gov.cn',  # 人民法院案例库
     'wenshu.court.gov.cn',   # 中国裁判文书网
     '12309.gov.cn',      # 中国检察网
     'ts.12348.gov.cn',   # 中国法律服务网
+    'flk.npc.gov.cn',    # 国家法律法规数据库
+    'gongbao.court.gov.cn',  # 最高人民法院公报
+    'ipc.court.gov.cn',  # 知识产权法庭
+    'moj.gov.cn',        # 司法部
+    'samr.gov.cn',       # 市场监管总局
+    'mohrss.gov.cn',     # 人社部
+    'chinatax.gov.cn',   # 税务总局
+    'pbc.gov.cn',        # 人民银行
+    'csrc.gov.cn',       # 证监会
+    'sccourt.gov.cn',    # 四川法院
+    'bjcourt.gov.cn',    # 北京法院
+    'shcourt.gov.cn',    # 上海法院
+    'gccourt.gov.cn',    # 广东法院
 ]
 
 # 低质量网站黑名单（范文/模板/内容农场/自媒体，内容不可靠，直接过滤）
@@ -132,88 +126,75 @@ def init_db():
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT UNIQUE NOT NULL,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
             created_at TEXT NOT NULL,
             last_login TEXT,
             login_count INTEGER DEFAULT 0
         );
-        CREATE TABLE IF NOT EXISTS verification_codes (
+        CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+        CREATE TABLE IF NOT EXISTS search_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT NOT NULL,
-            code TEXT NOT NULL,
-            created_at REAL NOT NULL,
-            expires_at REAL NOT NULL,
-            used INTEGER DEFAULT 0
+            user_id INTEGER NOT NULL,
+            question TEXT NOT NULL,
+            created_at TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_codes_phone ON verification_codes(phone, used);
-        CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
+        CREATE INDEX IF NOT EXISTS idx_history_user ON search_history(user_id, id);
     ''')
     conn.commit()
     conn.close()
 
 
-# ==================== 短信与验证码 ====================
+# ==================== 用户名密码验证 ====================
 
-def send_sms_code(phone, code):
-    if not SMS_AVAILABLE:
-        return False, '短信SDK未安装'
-    if not all([TENCENT_SECRET_ID, TENCENT_SECRET_KEY, SMS_SDK_APP_ID, SMS_SIGN_NAME, SMS_TEMPLATE_ID]):
-        return False, '短信配置不完整'
-    try:
-        cred = credential.Credential(TENCENT_SECRET_ID, TENCENT_SECRET_KEY)
-        hp = HttpProfile()
-        hp.reqMethod = "POST"
-        hp.endpoint = "sms.tencentcloudapi.com"
-        cp = ClientProfile()
-        cp.signMethod = "HmacSHA256"
-        cp.httpProfile = hp
-        client = sms_client.SmsClient(cred, "ap-guangzhou", cp)
-        req = sms_models.SendSmsRequest()
-        req.SmsSdkAppId = SMS_SDK_APP_ID
-        req.SignName = SMS_SIGN_NAME
-        req.TemplateId = SMS_TEMPLATE_ID
-        req.TemplateParamSet = [code, str(CODE_EXPIRE_MINUTES)]
-        req.PhoneNumberSet = [f"+86{phone}"]
-        resp = client.SendSms(req)
-        if resp.SendStatusSet and resp.SendStatusSet[0].Code == "Ok":
-            return True, '发送成功'
-        return False, f'发送失败: {resp.SendStatusSet[0].Message if resp.SendStatusSet else "未知"}'
-    except Exception as e:
-        return False, f'短信异常: {str(e)}'
+def validate_username(username):
+    """用户名：最多6个汉字或12个英文字母/数字（汉字算2个单位，总长不超过12）"""
+    if not username:
+        return False, '请输入用户名'
+    if not re.match(r'^[\u4e00-\u9fff\w]+$', username):
+        return False, '用户名只能包含汉字、字母和数字'
+    length = sum(2 if '\u4e00' <= ch <= '\u9fff' else 1 for ch in username)
+    if length > 12:
+        return False, '用户名太长（最多6个汉字或12个英文字符）'
+    if length < 2:
+        return False, '用户名太短（至少2个字符）'
+    return True, ''
 
 
-def validate_phone(phone):
-    return bool(re.match(r'^1[3-9]\d{9}$', phone))
+def validate_password(password):
+    """密码：最多30字符，必须包含大写字母、小写字母和数字"""
+    if not password:
+        return False, '请输入密码'
+    if len(password) > 30:
+        return False, '密码不能超过30个字符'
+    if len(password) < 6:
+        return False, '密码至少需要6个字符'
+    if not re.search(r'[A-Z]', password):
+        return False, '密码必须包含至少一个大写字母'
+    if not re.search(r'[a-z]', password):
+        return False, '密码必须包含至少一个小写字母'
+    if not re.search(r'[0-9]', password):
+        return False, '密码必须包含至少一个数字'
+    return True, ''
 
 
-def mask_phone(phone):
-    return phone[:3] + '****' + phone[7:] if len(phone) == 11 else phone
-
-
-def check_rate_limit(phone):
-    db = get_db()
-    row = db.execute(
-        'SELECT created_at FROM verification_codes WHERE phone=? ORDER BY created_at DESC LIMIT 1', (phone,)
-    ).fetchone()
-    if row:
-        elapsed = time.time() - row['created_at']
-        if elapsed < CODE_RESEND_SECONDS:
-            return False, int(CODE_RESEND_SECONDS - elapsed)
-    return True, 0
-
-
-def get_or_create_user(phone):
+def get_or_create_user(username, password_hash=None):
     db = get_db()
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    user = db.execute('SELECT * FROM users WHERE phone=?', (phone,)).fetchone()
+    user = db.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
     if user:
+        if password_hash is not None:
+            return None  # 注册时用户名已存在
         db.execute('UPDATE users SET last_login=?, login_count=login_count+1 WHERE id=?', (now, user['id']))
         db.commit()
         return dict(user)
     else:
-        cur = db.execute('INSERT INTO users (phone, created_at, last_login, login_count) VALUES (?,?,?,1)', (phone, now, now))
+        if password_hash is None:
+            return None  # 登录时用户不存在
+        cur = db.execute('INSERT INTO users (username, password_hash, created_at, last_login, login_count) VALUES (?,?,?,?,1)',
+                         (username, password_hash, now, now))
         db.commit()
-        return {'id': cur.lastrowid, 'phone': phone, 'created_at': now, 'last_login': now, 'login_count': 1}
+        return {'id': cur.lastrowid, 'username': username, 'created_at': now, 'last_login': now, 'login_count': 1}
 
 
 # ==================== 登录装饰器 ====================
@@ -229,7 +210,7 @@ def login_required(f):
     return decorated
 
 
-# ==================== 登录路由 ====================
+# ==================== 登录/注册路由 ====================
 
 @app.route('/login')
 def login_page():
@@ -238,35 +219,37 @@ def login_page():
     return render_template_string(LOGIN_TEMPLATE)
 
 
-@app.route('/api/send-code', methods=['POST'])
-def api_send_code():
+@app.route('/register')
+def register_page():
+    if 'user_id' in session:
+        return redirect('/')
+    return render_template_string(REGISTER_TEMPLATE)
+
+
+@app.route('/api/register', methods=['POST'])
+def api_register():
     data = request.get_json(silent=True)
     if not data:
         return jsonify(success=False, message='请求格式错误'), 400
-    phone = (data.get('phone') or '').strip()
-    if not validate_phone(phone):
-        return jsonify(success=False, message='请输入正确的11位手机号'), 400
-    allowed, wait = check_rate_limit(phone)
-    if not allowed:
-        return jsonify(success=False, message=f'发送太频繁，请{wait}秒后重试'), 429
-    code = ''.join(random.choices(string.digits, k=CODE_LENGTH))
-    success, msg = send_sms_code(phone, code)
-    if not success:
-        if os.environ.get('FLASK_ENV') == 'development':
-            print(f'[开发模式] {phone} 验证码: {code}')
-            db = get_db()
-            now = time.time()
-            db.execute('INSERT INTO verification_codes (phone,code,created_at,expires_at,used) VALUES (?,?,?,?,0)',
-                       (phone, code, now, now + CODE_EXPIRE_MINUTES * 60))
-            db.commit()
-            return jsonify(success=True, message=f'验证码已发送（开发模式: {code}）')
-        return jsonify(success=False, message=msg), 500
-    db = get_db()
-    now = time.time()
-    db.execute('INSERT INTO verification_codes (phone,code,created_at,expires_at,used) VALUES (?,?,?,?,0)',
-               (phone, code, now, now + CODE_EXPIRE_MINUTES * 60))
-    db.commit()
-    return jsonify(success=True, message=f'验证码已发送至 {mask_phone(phone)}，{CODE_EXPIRE_MINUTES}分钟内有效')
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+    ok, msg = validate_username(username)
+    if not ok:
+        return jsonify(success=False, message=msg), 400
+    ok, msg = validate_password(password)
+    if not ok:
+        return jsonify(success=False, message=msg), 400
+    pw_hash = generate_password_hash(password)
+    user = get_or_create_user(username, pw_hash)
+    if user is None:
+        return jsonify(success=False, message='用户名已被注册，请换一个'), 400
+    # 注册后自动登录
+    session.permanent = True
+    app.permanent_session_lifetime = timedelta(days=7)
+    session['user_id'] = user['id']
+    session['username'] = user['username']
+    session['login_time'] = datetime.now().isoformat()
+    return jsonify(success=True, message='注册成功', redirect='/')
 
 
 @app.route('/api/login', methods=['POST'])
@@ -274,30 +257,21 @@ def api_login():
     data = request.get_json(silent=True)
     if not data:
         return jsonify(success=False, message='请求格式错误'), 400
-    phone = (data.get('phone') or '').strip()
-    code = (data.get('code') or '').strip()
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
     remember = bool(data.get('remember', False))
-    if not validate_phone(phone):
-        return jsonify(success=False, message='手机号格式错误'), 400
-    if not code or len(code) != CODE_LENGTH:
-        return jsonify(success=False, message=f'请输入{CODE_LENGTH}位验证码'), 400
-    # 校验验证码
+    if not username or not password:
+        return jsonify(success=False, message='请输入用户名和密码'), 400
     db = get_db()
-    now = time.time()
-    row = db.execute(
-        'SELECT id, code, expires_at FROM verification_codes WHERE phone=? AND used=0 ORDER BY created_at DESC LIMIT 1',
-        (phone,)
-    ).fetchone()
-    if not row:
-        return jsonify(success=False, message='验证码不存在，请重新获取'), 400
-    if now > row['expires_at']:
-        return jsonify(success=False, message='验证码已过期，请重新获取'), 400
-    if row['code'] != code:
-        return jsonify(success=False, message='验证码错误'), 400
-    db.execute('UPDATE verification_codes SET used=1 WHERE id=?', (row['id'],))
+    user = db.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+    if not user:
+        return jsonify(success=False, message='用户名或密码错误'), 400
+    if not check_password_hash(user['password_hash'], password):
+        return jsonify(success=False, message='用户名或密码错误'), 400
+    # 更新登录信息
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db.execute('UPDATE users SET last_login=?, login_count=login_count+1 WHERE id=?', (now, user['id']))
     db.commit()
-    # 创建/获取用户
-    user = get_or_create_user(phone)
     # 创建会话
     session.permanent = True
     if remember:
@@ -305,7 +279,7 @@ def api_login():
     else:
         app.permanent_session_lifetime = timedelta(days=7)
     session['user_id'] = user['id']
-    session['phone'] = user['phone']
+    session['username'] = user['username']
     session['login_time'] = datetime.now().isoformat()
     return jsonify(success=True, message='登录成功', redirect='/')
 
@@ -324,7 +298,7 @@ def api_user_info():
     if not user:
         session.clear()
         return jsonify(error='用户不存在'), 404
-    return jsonify(id=user['id'], phone=mask_phone(user['phone']),
+    return jsonify(id=user['id'], username=user['username'],
                    created_at=user['created_at'], login_count=user['login_count'])
 
 
@@ -362,6 +336,54 @@ def web_search(question, max_results=6):
         results = results[:max_results]
     except Exception as e:
         print(f'[联网搜索] 失败: {e}')
+        return []
+    return results
+
+
+def official_web_search(question, max_results=6):
+    """严格官方搜索：仅接受政府/官方来源，排除一切私人网站和个人观点"""
+    if not WEB_SEARCH_AVAILABLE:
+        return []
+    results = []
+    try:
+        # 多组关键词搜索，覆盖法律条文、地方法规、司法解释
+        queries = [
+            f'{question} 法律条文 法规',
+            f'{question} 司法解释 最高人民法院',
+            f'{question} 地方法规 条例 规定',
+        ]
+        seen_urls = set()
+        for query in queries:
+            try:
+                raw = list(DDGS().text(query, region='cn-zh', max_results=10))
+            except TypeError:
+                raw = list(DDGS().text(query, max_results=10))
+            for item in raw:
+                url = item.get('href', '') or item.get('url', '') or item.get('link', '')
+                title = (item.get('title', '') or '').strip()
+                body = (item.get('body', '') or item.get('snippet', '') or item.get('content', '') or '').strip()
+                if not title or not body:
+                    continue
+                if url in seen_urls:
+                    continue
+                # 严格过滤：只接受官方域名
+                if not any(d in url for d in TRUSTED_LEGAL_DOMAINS):
+                    continue
+                # 排除黑名单
+                if any(j in url for j in JUNK_DOMAINS):
+                    continue
+                # 排除个人观点性质的内容（博客、论坛、问答、自媒体）
+                opinion_markers = ['博客', '论坛', '知乎', '百度知道', '个人', '我认为', '我觉得',
+                                   '网友', '楼主', '自媒体', '公众号', '头条号', '百家号']
+                if any(m in title or m in body for m in opinion_markers):
+                    continue
+                seen_urls.add(url)
+                results.append({'title': title, 'body': body[:500], 'url': url, 'trusted': True})
+            if len(results) >= max_results:
+                break
+        results = results[:max_results]
+    except Exception as e:
+        print(f'[官方搜索] 失败: {e}')
         return []
     return results
 
@@ -582,24 +604,37 @@ class LegalDocManager:
 
     def search_only(self, question):
         results = self.search(question, top_n=8)
-        if not self.chunks:
+        # 同时从官方渠道联网检索更多法律条文、地方法规、司法解释
+        web_results = official_web_search(question, max_results=5)
+        if not self.chunks and not web_results:
             return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
-        if not results:
-            return {'answer': '抱歉，没有找到相关法律条文。建议换一种方式提问，或上传更多法律文件。',
+        if not results and not web_results:
+            return {'answer': '抱歉，没有找到相关法律条文。建议换一种方式提问，或开启联网搜索获取更多结果。',
                     'citations': [], 'ai_used': False}
         kw_str = '、'.join(self._keywords(question)[:6])
-        header = f"找到以下 {len(results)} 条相关法条"
-        if kw_str:
-            header += f"（关键词：{kw_str}）"
-        header += '：\n\n'
         citations = []
+        web_citations = []
         display_parts = []
-        for chunk in results:
-            src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
-            display = chunk['content'][:600] + ('……' if len(chunk['content']) > 600 else '')
-            display_parts.append(f"【{chunk['title']}】（{src_display}）\n{display}")
-            citations.append({'title': chunk['title'], 'source': src_display})
-        return {'answer': header + '\n\n'.join(display_parts), 'citations': citations, 'ai_used': False}
+        # 本地法律库结果
+        if results:
+            header = f"【法律库检索结果】共 {len(results)} 条"
+            if kw_str:
+                header += f"（关键词：{kw_str}）"
+            display_parts.append(header + '：\n')
+            for chunk in results:
+                src_display = chunk['source'].split('/')[-1] if '/' in chunk['source'] else chunk['source']
+                display = chunk['content'][:600] + ('……' if len(chunk['content']) > 600 else '')
+                display_parts.append(f"● {chunk['title']}（{src_display}）\n{display}")
+                citations.append({'title': chunk['title'], 'source': src_display})
+        # 官方联网补充结果
+        if web_results:
+            display_parts.append(f"\n【官方来源补充】共 {len(web_results)} 条（仅政府/司法机关官方发布）：\n")
+            for wr in web_results:
+                display_parts.append(f"● {wr['title']}\n  {wr['body'][:300]}")
+                web_citations.append({'title': wr['title'][:40], 'source': '官方来源', 'url': wr['url']})
+        # 严谨性提示
+        display_parts.append('\n⚖️ 以上结果均来自法律法规数据库及政府官方渠道，仅供参考。具体案件的法律适用请以有权机关的正式文本为准，建议咨询专业律师获取针对性意见。')
+        return {'answer': '\n\n'.join(display_parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
     def search_cases_only(self, question):
         local_results = self.search(question, top_n=6)
@@ -767,8 +802,7 @@ def extract_text(file_storage, filename):
 def health():
     return jsonify(status='ok', docs=len(dm.documents), chunks=len(dm.chunks),
                    laws=dm.law_count, categories=dm.category_count,
-                   ai='deepseek' if DEEPSEEK_API_KEY else 'off',
-                   sms=SMS_AVAILABLE)
+                   ai='deepseek' if DEEPSEEK_API_KEY else 'off')
 
 @app.route('/api/stats')
 def stats():
@@ -791,6 +825,8 @@ def websearch_debug():
 @app.route('/api/upload', methods=['POST'])
 @login_required
 def upload():
+    if session.get('username') != DEV_USERNAME:
+        return jsonify(error='仅开发者账户可上传文件'), 403
     f = request.files.get('file')
     if not f or not f.filename:
         return jsonify(error='没有选择文件'), 400
@@ -829,6 +865,11 @@ def chat():
     if not data or not (data.get('question') or '').strip():
         return jsonify(error='请输入问题'), 400
     question = data['question'].strip()
+    # 记录搜索历史
+    db = get_db()
+    db.execute('INSERT INTO search_history (user_id, question, created_at) VALUES (?,?,?)',
+               (session['user_id'], question, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    db.commit()
     mode = data.get('mode', 'ai')
     history = data.get('history', [])
     use_web = bool(data.get('use_web', False))
@@ -841,6 +882,26 @@ def chat():
     else:
         result = dm.answer_with_ai(question, history, use_web, use_case)
     return jsonify(result)
+
+@app.route('/api/history', methods=['GET'])
+@login_required
+def get_history():
+    db = get_db()
+    rows = db.execute(
+        'SELECT id, question, created_at FROM search_history WHERE user_id=? ORDER BY id DESC LIMIT 20',
+        (session['user_id'],)
+    ).fetchall()
+    return jsonify(history=[{'id': r['id'], 'q': r['question'], 't': r['created_at']} for r in rows])
+
+
+@app.route('/api/history/<int:hid>', methods=['DELETE'])
+@login_required
+def delete_history(hid):
+    db = get_db()
+    db.execute('DELETE FROM search_history WHERE id=? AND user_id=?', (hid, session['user_id']))
+    db.commit()
+    return jsonify(success=True)
+
 
 @app.route('/api/article', methods=['GET'])
 @login_required
@@ -859,7 +920,8 @@ def get_article():
 def index():
     if 'user_id' not in session:
         return redirect('/login')
-    return render_template_string(HTML_TEMPLATE, phone=mask_phone(session.get('phone', '')))
+    is_dev = session.get('username') == DEV_USERNAME
+    return render_template_string(HTML_TEMPLATE, username=session.get('username', ''), is_dev=is_dev)
 
 # ==================== 登录页模板 ====================
 LOGIN_TEMPLATE = r'''<!DOCTYPE html>
@@ -878,13 +940,13 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:linear-gr
 .login-header p{font-size:14px;color:#666}
 .form-group{margin-bottom:18px}
 .form-group label{display:block;font-size:14px;color:#333;margin-bottom:7px;font-weight:500}
-.input-row{display:flex;gap:10px}
-.form-group input[type=tel],.form-group input[type=text]{width:100%;padding:12px 14px;border:2px solid #e2e8f0;border-radius:10px;font-size:16px;outline:none;transition:border-color .2s}
+.form-group input{width:100%;padding:12px 14px;border:2px solid #e2e8f0;border-radius:10px;font-size:16px;outline:none;transition:border-color .2s}
 .form-group input:focus{border-color:#4299e1}
-.input-row input{flex:1}
-.btn-code{flex-shrink:0;padding:12px 18px;background:#2c5282;color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;transition:background .2s;white-space:nowrap}
-.btn-code:hover:not(:disabled){background:#1a365d}
-.btn-code:disabled{opacity:.6;cursor:not-allowed;background:#718096}
+.pwd-wrap{position:relative}
+.pwd-wrap input{padding-right:44px}
+.eye-btn{position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;padding:4px;color:#a0aec0;transition:color .2s;display:flex;align-items:center}
+.eye-btn:hover{color:#4a5568}
+.eye-btn svg{width:20px;height:20px}
 .remember-row{display:flex;align-items:center;gap:8px;margin:14px 0;font-size:14px;color:#4a5568;cursor:pointer;user-select:none}
 .remember-row input{width:16px;height:16px;cursor:pointer}
 .btn-login{width:100%;padding:14px;background:linear-gradient(135deg,#2c5282,#2b6cb0);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;transition:transform .15s,box-shadow .15s}
@@ -893,7 +955,10 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:linear-gr
 .msg{margin-top:14px;padding:11px 14px;border-radius:8px;font-size:13px;display:none}
 .msg.error{display:block;background:#fff5f5;border:1px solid #fed7d7;color:#c53030}
 .msg.success{display:block;background:#f0fff4;border:1px solid #c6f6d5;color:#276749}
-.login-footer{text-align:center;margin-top:20px;font-size:12px;color:#a0aec0}
+.register-link{text-align:center;margin-top:20px;font-size:14px;color:#718096}
+.register-link a{color:#2b6cb0;font-weight:600;text-decoration:none}
+.register-link a:hover{text-decoration:underline}
+.login-footer{text-align:center;margin-top:14px;font-size:12px;color:#a0aec0}
 .loading{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-radius:50%;border-top-color:#fff;animation:spin .7s linear infinite;vertical-align:middle;margin-right:5px}
 @keyframes spin{to{transform:rotate(360deg)}}
 </style>
@@ -903,57 +968,159 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:linear-gr
   <div class="login-header">
     <div class="icon">&#9878;</div>
     <h1>法律问答助手</h1>
-    <p>手机号验证码登录 · 4868部法律法规 · AI智能解答</p>
+    <p>4868部法律法规 · AI智能解答 · 典型案例</p>
   </div>
   <form onsubmit="return false">
     <div class="form-group">
-      <label>手机号</label>
-      <input type="tel" id="phone" placeholder="请输入11位手机号" maxlength="11" inputmode="numeric" autocomplete="tel">
+      <label>用户名</label>
+      <input type="text" id="username" placeholder="请输入用户名" maxlength="12" autocomplete="username">
     </div>
     <div class="form-group">
-      <label>验证码</label>
-      <div class="input-row">
-        <input type="text" id="code" placeholder="6位验证码" maxlength="6" inputmode="numeric" autocomplete="one-time-code">
-        <button type="button" class="btn-code" id="btnCode" onclick="sendCode()">获取验证码</button>
+      <label>密码</label>
+      <div class="pwd-wrap">
+        <input type="password" id="password" placeholder="请输入密码" maxlength="30" autocomplete="current-password">
+        <button type="button" class="eye-btn" id="eyeBtn" onclick="togglePwd()" title="显示/隐藏密码">
+          <svg id="eyeOff" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+          <svg id="eyeOn" style="display:none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
       </div>
     </div>
     <label class="remember-row"><input type="checkbox" id="remember" checked> 记住我（30天内免登录）</label>
     <button type="submit" class="btn-login" id="btnLogin" onclick="doLogin()">登 录</button>
   </form>
   <div id="msg" class="msg"></div>
-  <div class="login-footer">未注册的手机号验证后将自动创建账号</div>
+  <div class="register-link">还没有账户？<a href="/register">注册一个</a></div>
+  <div class="login-footer">法律问答助手 v5.1 · 安全加密存储</div>
 </div>
 <script>
-let cd=0,tm=null;
-document.getElementById('phone').oninput=function(){this.value=this.value.replace(/\D/g,'')};
-document.getElementById('code').oninput=function(){this.value=this.value.replace(/\D/g,'')};
-document.getElementById('phone').onkeydown=function(e){if(e.key==='Enter')sendCode()};
-document.getElementById('code').onkeydown=function(e){if(e.key==='Enter')doLogin()};
+document.getElementById('username').onkeydown=function(e){if(e.key==='Enter')document.getElementById('password').focus()};
+document.getElementById('password').onkeydown=function(e){if(e.key==='Enter')doLogin()};
+function togglePwd(){
+  const p=document.getElementById('password'),off=document.getElementById('eyeOff'),on=document.getElementById('eyeOn');
+  if(p.type==='password'){p.type='text';off.style.display='none';on.style.display='block'}
+  else{p.type='password';off.style.display='block';on.style.display='none'}
+}
 function showMsg(t,type){const el=document.getElementById('msg');el.textContent=t;el.className='msg '+type}
 function hideMsg(){document.getElementById('msg').className='msg'}
-function startCd(s){cd=s;const b=document.getElementById('btnCode');b.disabled=true;b.textContent=cd+'s';tm=setInterval(()=>{cd--;if(cd<=0){clearInterval(tm);b.disabled=false;b.textContent='获取验证码'}else b.textContent=cd+'s'},1000)}
-async function sendCode(){
-  const p=document.getElementById('phone').value.trim();
-  if(!/^1[3-9]\d{9}$/.test(p)){showMsg('请输入正确的11位手机号','error');return}
-  hideMsg();const b=document.getElementById('btnCode');b.disabled=true;b.innerHTML='<span class="loading"></span>';
-  try{
-    const r=await fetch('/api/send-code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:p})});
-    const d=await r.json();
-    if(d.success){showMsg(d.message,'success');startCd(60);document.getElementById('code').focus()}
-    else{showMsg(d.message,'error');b.disabled=false;b.textContent='获取验证码'}
-  }catch{showMsg('网络错误','error');b.disabled=false;b.textContent='获取验证码'}
-}
 async function doLogin(){
-  const p=document.getElementById('phone').value.trim(),c=document.getElementById('code').value.trim();
-  if(!/^1[3-9]\d{9}$/.test(p)){showMsg('请输入正确的手机号','error');return}
-  if(!/^\d{6}$/.test(c)){showMsg('请输入6位验证码','error');return}
+  const u=document.getElementById('username').value.trim(),p=document.getElementById('password').value;
+  if(!u){showMsg('请输入用户名','error');return}
+  if(!p){showMsg('请输入密码','error');return}
   hideMsg();const b=document.getElementById('btnLogin');b.disabled=true;b.innerHTML='<span class="loading"></span>登录中...';
   try{
-    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:p,code:c,remember:document.getElementById('remember').checked})});
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,remember:document.getElementById('remember').checked})});
     const d=await r.json();
     if(d.success){showMsg('登录成功，正在进入...','success');setTimeout(()=>location.href='/',600)}
     else{showMsg(d.message,'error');b.disabled=false;b.textContent='登 录'}
   }catch{showMsg('网络错误','error');b.disabled=false;b.textContent='登 录'}
+}
+</script>
+</body>
+</html>'''
+
+# ==================== 注册页模板 ====================
+REGISTER_TEMPLATE = r'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>注册 - 法律问答助手</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:linear-gradient(135deg,#1a365d 0%,#2c5282 50%,#2b6cb0 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.login-card{background:#fff;border-radius:16px;padding:44px 38px;width:100%;max-width:400px;box-shadow:0 20px 60px rgba(0,0,0,.25)}
+.login-header{text-align:center;margin-bottom:32px}
+.login-header .icon{font-size:48px;margin-bottom:12px}
+.login-header h1{font-size:22px;color:#1a365d;margin-bottom:6px}
+.login-header p{font-size:14px;color:#666}
+.form-group{margin-bottom:18px}
+.form-group label{display:block;font-size:14px;color:#333;margin-bottom:7px;font-weight:500}
+.form-group input{width:100%;padding:12px 14px;border:2px solid #e2e8f0;border-radius:10px;font-size:16px;outline:none;transition:border-color .2s}
+.form-group input:focus{border-color:#4299e1}
+.form-group .hint{font-size:12px;color:#a0aec0;margin-top:5px}
+.pwd-wrap{position:relative}
+.pwd-wrap input{padding-right:44px}
+.eye-btn{position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;padding:4px;color:#a0aec0;transition:color .2s;display:flex;align-items:center}
+.eye-btn:hover{color:#4a5568}
+.eye-btn svg{width:20px;height:20px}
+.btn-login{width:100%;padding:14px;background:linear-gradient(135deg,#2c5282,#2b6cb0);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;transition:transform .15s,box-shadow .15s;margin-top:6px}
+.btn-login:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 20px rgba(44,82,130,.4)}
+.btn-login:disabled{opacity:.7;cursor:not-allowed;transform:none}
+.msg{margin-top:14px;padding:11px 14px;border-radius:8px;font-size:13px;display:none}
+.msg.error{display:block;background:#fff5f5;border:1px solid #fed7d7;color:#c53030}
+.msg.success{display:block;background:#f0fff4;border:1px solid #c6f6d5;color:#276749}
+.register-link{text-align:center;margin-top:20px;font-size:14px;color:#718096}
+.register-link a{color:#2b6cb0;font-weight:600;text-decoration:none}
+.register-link a:hover{text-decoration:underline}
+.loading{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-radius:50%;border-top-color:#fff;animation:spin .7s linear infinite;vertical-align:middle;margin-right:5px}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="login-header">
+    <div class="icon">&#9878;</div>
+    <h1>注册新账户</h1>
+    <p>创建账户后即可使用全部功能</p>
+  </div>
+  <form onsubmit="return false">
+    <div class="form-group">
+      <label>用户名</label>
+      <input type="text" id="username" placeholder="汉字最多6个，英文最多12位" maxlength="12" autocomplete="username">
+      <div class="hint">支持汉字、字母、数字（汉字算2个字符）</div>
+    </div>
+    <div class="form-group">
+      <label>密码</label>
+      <div class="pwd-wrap">
+        <input type="password" id="password" placeholder="设置密码" maxlength="30" autocomplete="new-password">
+        <button type="button" class="eye-btn" onclick="togglePwd('password',this)" title="显示/隐藏密码">
+          <svg class="eyeOff" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+          <svg class="eyeOn" style="display:none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+      </div>
+      <div class="hint">6~30位，必须包含大写字母、小写字母和数字</div>
+    </div>
+    <div class="form-group">
+      <label>确认密码</label>
+      <div class="pwd-wrap">
+        <input type="password" id="password2" placeholder="再次输入密码" maxlength="30" autocomplete="new-password">
+        <button type="button" class="eye-btn" onclick="togglePwd('password2',this)" title="显示/隐藏密码">
+          <svg class="eyeOff" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+          <svg class="eyeOn" style="display:none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+      </div>
+    </div>
+    <button type="submit" class="btn-login" id="btnReg" onclick="doRegister()">注 册</button>
+  </form>
+  <div id="msg" class="msg"></div>
+  <div class="register-link">已有账户？<a href="/login">去登录</a></div>
+</div>
+<script>
+document.getElementById('username').onkeydown=function(e){if(e.key==='Enter')document.getElementById('password').focus()};
+document.getElementById('password').onkeydown=function(e){if(e.key==='Enter')document.getElementById('password2').focus()};
+document.getElementById('password2').onkeydown=function(e){if(e.key==='Enter')doRegister()};
+function togglePwd(id,btn){
+  const p=document.getElementById(id),off=btn.querySelector('.eyeOff'),on=btn.querySelector('.eyeOn');
+  if(p.type==='password'){p.type='text';off.style.display='none';on.style.display='block'}
+  else{p.type='password';off.style.display='block';on.style.display='none'}
+}
+function showMsg(t,type){const el=document.getElementById('msg');el.textContent=t;el.className='msg '+type}
+function hideMsg(){document.getElementById('msg').className='msg'}
+async function doRegister(){
+  const u=document.getElementById('username').value.trim(),p=document.getElementById('password').value,p2=document.getElementById('password2').value;
+  if(!u){showMsg('请输入用户名','error');return}
+  if(!p){showMsg('请输入密码','error');return}
+  if(p!==p2){showMsg('两次输入的密码不一致','error');return}
+  if(!/[A-Z]/.test(p)){showMsg('密码必须包含至少一个大写字母','error');return}
+  if(!/[a-z]/.test(p)){showMsg('密码必须包含至少一个小写字母','error');return}
+  if(!/[0-9]/.test(p)){showMsg('密码必须包含至少一个数字','error');return}
+  hideMsg();const b=document.getElementById('btnReg');b.disabled=true;b.innerHTML='<span class="loading"></span>注册中...';
+  try{
+    const r=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const d=await r.json();
+    if(d.success){showMsg('注册成功，正在进入...','success');setTimeout(()=>location.href='/',600)}
+    else{showMsg(d.message,'error');b.disabled=false;b.textContent='注 册'}
+  }catch{showMsg('网络错误','error');b.disabled=false;b.textContent='注 册'}
 }
 </script>
 </body>
@@ -1002,6 +1169,16 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   .doc-item .dm{font-size:11px;color:#a0aec0}
   .doc-item .dd{background:none;border:none;font-size:16px;color:#e53e3e;cursor:pointer;padding:4px 8px;border-radius:6px}
   .doc-item .dd:hover{background:#fff5f5}
+  .history-section{margin:8px 16px;border-top:1px solid #e2e8f0;padding-top:10px}
+  .history-title{font-size:13px;font-weight:600;color:#4a5568;margin-bottom:8px}
+  .history-list{max-height:180px;overflow-y:auto}
+  .history-empty{font-size:12px;color:#a0aec0;text-align:center;padding:8px}
+  .history-item{display:flex;align-items:center;gap:8px;padding:7px 10px;margin-bottom:4px;background:#f7fafc;border-radius:8px;cursor:pointer;transition:background .15s;font-size:13px;color:#4a5568}
+  .history-item:hover{background:#ebf8ff;color:#2b6cb0}
+  .history-item .hq{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+  .history-item .ht{font-size:11px;color:#a0aec0;flex-shrink:0}
+  .history-item .hd{background:none;border:none;font-size:13px;color:#cbd5e0;cursor:pointer;padding:2px 5px;border-radius:4px;flex-shrink:0;transition:all .15s}
+  .history-item .hd:hover{color:#e53e3e;background:#fff5f5}
   .flk-link{margin:8px 16px 12px;padding:10px;background:#f0fff4;border-radius:10px;text-align:center}
   .flk-link a{color:#276749;font-size:13px;text-decoration:none;font-weight:500}
   .flk-link a:hover{text-decoration:underline}
@@ -1060,9 +1237,9 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   <span class="icon">&#9878;</span>
   <h1>法律问答助手</h1>
   <span class="sub">DeepSeek AI · 4868部法律法规 + 司法解释 + 典型案例</span>
-  <span class="badge">全量法律库 v5.0</span>
+  <span class="badge">全量法律库 v5.1</span>
   <div class="user-box">
-    <span class="user-phone">&#128100; {{ phone }}</span>
+    <span class="user-phone">&#128100; {{ username }}</span>
     <button class="btn-out" onclick="logout()">退出</button>
   </div>
 </div>
@@ -1070,6 +1247,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   <div class="sidebar">
     <div class="sidebar-title">&#128218; 法律知识库</div>
     <div class="stats-bar" id="statsBar">正在加载法律库统计…</div>
+    {% if is_dev %}
     <div class="upload-zone" id="uploadZone">
       <div class="ui">&#128228;</div>
       <p>上传更多法律文件</p>
@@ -1077,7 +1255,12 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
       <input type="file" id="fileInput" accept=".txt,.pdf" multiple>
     </div>
     <div class="upload-status" id="uploadStatus"></div>
+    {% endif %}
     <div class="doc-list" id="docList"></div>
+    <div class="history-section">
+      <div class="history-title">&#128336; 搜索记录</div>
+      <div class="history-list" id="historyList"><div class="history-empty">暂无搜索记录</div></div>
+    </div>
     <div class="flk-link">
       <a href="https://flk.npc.gov.cn/" target="_blank">&#128279; 在国家法律法规数据库中搜索</a>
     </div>
@@ -1124,18 +1307,22 @@ function setMode(m){chatMode=m;const ai=document.getElementById('modeAi'),se=doc
 function setBtnStop(s){const b=document.getElementById('sendBtn');if(s){b.textContent='\u23F9 停止';b.className='send-btn stop';b.onclick=cancelSend}else{b.textContent='发送提问';b.className='send-btn';b.onclick=send}}
 function cancelSend(){if(abortCtrl){abortCtrl.abort();abortCtrl=null}}
 async function logout(){try{await fetch('/api/logout',{method:'POST'})}catch{};location.href='/login'}
-window.addEventListener('DOMContentLoaded',()=>{loadDocs();loadStats();ar()});
+window.addEventListener('DOMContentLoaded',()=>{loadDocs();loadStats();loadHistory();ar()});
 const fi=document.getElementById('fileInput'),uz=document.getElementById('uploadZone'),us=document.getElementById('uploadStatus');
+if(fi&&uz&&us){
 fi.addEventListener('change',e=>{if(e.target.files.length)upAll(e.target.files)});
 uz.addEventListener('dragover',e=>{e.preventDefault();uz.classList.add('dragover')});
 uz.addEventListener('dragleave',()=>uz.classList.remove('dragover'));
 uz.addEventListener('drop',e=>{e.preventDefault();uz.classList.remove('dragover');if(e.dataTransfer.files.length)upAll(e.dataTransfer.files)});
-async function upAll(files){for(const f of files)await upOne(f);fi.value='';loadDocs()}
+}
+async function upAll(files){for(const f of files)await upOne(f);if(fi)fi.value='';loadDocs()}
 async function upOne(file){ss('loading','正在上传 "'+file.name+'"…');const fd=new FormData();fd.append('file',file);try{const r=await fetch('/api/upload',{method:'POST',body:fd});const d=await r.json();if(r.ok&&d.success)ss('success',d.message);else ss('error',d.error||'上传失败')}catch{ss('error','网络错误')}}
 function ss(t,m){us.className='upload-status '+t;us.textContent=m;if(t==='success')setTimeout(()=>us.className='upload-status',5000)}
 async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const cats=Object.entries(d.categories||{}).sort((a,b)=>b[1]-a[1]).slice(0,6).map(e=>e[0]).join('、');document.getElementById('statsBar').innerHTML='<b>'+d.total+'</b> 部法律法规 · <b>'+d.chunks.toLocaleString()+'</b> 个条文<br>涵盖：'+cats+' 等'}catch{document.getElementById('statsBar').textContent='法律库已就绪'}}
 async function loadDocs(){try{const r=await fetch('/api/documents');if(r.status===401){location.href='/login';return}const d=await r.json();rdl(d.documents)}catch{}}
-function rdl(docs){const el=document.getElementById('docList');const uploads=docs.filter(d=>!d.builtin);if(!uploads.length){el.innerHTML='<div style="text-align:center;padding:16px;color:#a0aec0;font-size:13px">内置法律库已包含全部法律法规<br>如需补充可上传文件</div>';return}el.innerHTML='<div style="padding:4px 0 8px;font-size:12px;color:#718096">用户上传 ('+uploads.length+')</div>'+uploads.map(d=>{const icon=d.name.endsWith('.pdf')?'&#128211;':'&#128196;';const dn=d.name.replace(/^upload_/,'');return `<div class="doc-item"><span class="di">${icon}</span><div class="info"><div class="dn" title="${dn}">${dn}</div><div class="dm">${d.articles>0?d.articles+' 条法条':d.chunks+' 个段落'}</div></div><button class="dd" onclick="dd('${d.name}')" title="删除">&#10005;</button></div>`}).join('')}
+function rdl(docs){const el=document.getElementById('docList');const uploads=docs.filter(d=>!d.builtin);if(!uploads.length){el.innerHTML='';return}el.innerHTML='<div style="padding:4px 0 8px;font-size:12px;color:#718096">用户上传 ('+uploads.length+')</div>'+uploads.map(d=>{const icon=d.name.endsWith('.pdf')?'&#128211;':'&#128196;';const dn=d.name.replace(/^upload_/,'');return `<div class="doc-item"><span class="di">${icon}</span><div class="info"><div class="dn" title="${dn}">${dn}</div><div class="dm">${d.articles>0?d.articles+' 条法条':d.chunks+' 个段落'}</div></div><button class="dd" onclick="dd('${d.name}')" title="删除">&#10005;</button></div>`}).join('')}
+async function loadHistory(){try{const r=await fetch('/api/history');if(!r.ok)return;const d=await r.json();const el=document.getElementById('historyList');if(!d.history||!d.history.length){el.innerHTML='<div class="history-empty">暂无搜索记录</div>';return}el.innerHTML=d.history.map(h=>{const t=h.t?h.t.slice(5,16):'';return `<div class="history-item"><span class="hq" onclick="fill('${esc(h.q).replace(/'/g,"\\'")}')">${esc(h.q)}</span><span class="ht">${t}</span><button class="hd" onclick="delHistory(${h.id})" title="删除">&#10005;</button></div>`}).join('')}catch{}}
+async function delHistory(id){try{await fetch('/api/history/'+id,{method:'DELETE'});loadHistory()}catch{}}
 async function dd(n){if(!confirm('确定删除吗？'))return;try{await fetch('/api/documents/'+encodeURIComponent(n),{method:'DELETE'});loadDocs()}catch{alert('删除失败')}}
 function fill(t){document.getElementById('qInput').value=t;document.getElementById('qInput').focus()}
 function hk(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}}
@@ -1152,7 +1339,7 @@ async function send(){
     if(d.answer){addMsg('bot',d.answer,d.citations,d.ai_used,d.web_citations);chatHistory.push({role:'assistant',content:d.answer})}
     else if(d.error)addMsg('bot','错误：'+d.error)}
   catch(e){ld.remove();if(e.name==='AbortError'){addMsg('bot','\u23F9 已取消提问，未消耗tokens。',[],false);chatHistory.pop()}else addMsg('bot','网络错误，请稍后再试。')}
-  busy=false;abortCtrl=null;setBtnStop(false)
+  busy=false;abortCtrl=null;setBtnStop(false);loadHistory()
 }
 function addMsg(role,text,cites,aiUsed,webCites){
   const c=document.getElementById('messages'),r=document.createElement('div');r.className='msg-row '+role;
@@ -1178,14 +1365,24 @@ async function showArticle(title,source){
 # ==================== 启动 ====================
 init_db()
 
+# 确保开发者账户存在
+_conn = sqlite3.connect(DB_PATH)
+_exists = _conn.execute('SELECT id FROM users WHERE username=?', (DEV_USERNAME,)).fetchone()
+if not _exists:
+    _conn.execute('INSERT INTO users (username, password_hash, created_at, last_login, login_count) VALUES (?,?,?,?,0)',
+                  (DEV_USERNAME, generate_password_hash(DEV_PASSWORD), datetime.now().strftime('%Y-%m-%d %H:%M:%S'), None))
+    _conn.commit()
+    print(f'[用户系统] 已创建开发者账户: {DEV_USERNAME}')
+_conn.close()
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print()
     print('=' * 50)
-    print('    法律问答助手 v5.0 (全量法律库 + AI + 案例搜索 + 登录)')
+    print('    法律问答助手 v5.1 (全量法律库 + AI + 案例搜索 + 登录)')
     print(f'    内置法律: {dm.law_count} 部, {len(dm.chunks)} 个条文')
     print(f'    AI 引擎:  {"DeepSeek" if DEEPSEEK_API_KEY else "未配置"}')
-    print(f'    短信服务: {"腾讯云SMS" if SMS_AVAILABLE else "未安装(开发模式)"}')
+    print(f'    用户系统: 用户名密码登录 + 注册')
     print(f'    访问:     http://127.0.0.1:{port}')
     print('=' * 50)
     app.run(host='0.0.0.0', port=port, debug=False)

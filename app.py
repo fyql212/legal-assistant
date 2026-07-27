@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════╗
-║   法律问答助手 v5.1 — 全量法律库 + AI + 案例搜索     ║
+║   法律问答助手 v5.2 — 全量法律库 + AI + 案例搜索     ║
 ║                                                      ║
 ║  内置法律库：4868部法律法规 + 司法解释 + 典型案例     ║
 ║  AI 引擎：  DeepSeek 大模型智能回答                   ║
 ║  特色功能：联网搜索 · 两高典型案例检索                ║
 ║  用户系统：用户名密码登录 · 注册 · 记住我             ║
-║  部署平台：Railway.com                                ║
+║  性能优化：倒排索引 · 并行搜索 · 预加载分词           ║
+║  部署平台：PythonAnywhere                             ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -20,6 +21,8 @@ import sqlite3
 import secrets
 from datetime import datetime, timedelta
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
 
 import requests as http_requests
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, g
@@ -27,10 +30,12 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
     import jieba
+    jieba.initialize()  # 启动时预加载词典，避免首次查询卡顿
 except ImportError:
     import subprocess, sys
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'jieba'])
     import jieba
+    jieba.initialize()
 
 WEB_SEARCH_AVAILABLE = False
 DDGS = None
@@ -341,44 +346,52 @@ def web_search(question, max_results=6):
 
 
 def official_web_search(question, max_results=6):
-    """严格官方搜索：仅接受政府/官方来源，排除一切私人网站和个人观点"""
+    """严格官方搜索：仅接受政府/官方来源，排除一切私人网站和个人观点（并行加速）"""
     if not WEB_SEARCH_AVAILABLE:
         return []
     results = []
     try:
-        # 多组关键词搜索，覆盖法律条文、地方法规、司法解释
         queries = [
-            f'{question} 法律条文 法规',
-            f'{question} 司法解释 最高人民法院',
+            f'{question} 法律条文 法规 司法解释',
             f'{question} 地方法规 条例 规定',
         ]
-        seen_urls = set()
-        for query in queries:
+
+        def _do_query(query):
             try:
-                raw = list(DDGS().text(query, region='cn-zh', max_results=10))
+                raw = list(DDGS().text(query, region='cn-zh', max_results=8))
             except TypeError:
-                raw = list(DDGS().text(query, max_results=10))
-            for item in raw:
-                url = item.get('href', '') or item.get('url', '') or item.get('link', '')
-                title = (item.get('title', '') or '').strip()
-                body = (item.get('body', '') or item.get('snippet', '') or item.get('content', '') or '').strip()
-                if not title or not body:
-                    continue
-                if url in seen_urls:
-                    continue
-                # 严格过滤：只接受官方域名
-                if not any(d in url for d in TRUSTED_LEGAL_DOMAINS):
-                    continue
-                # 排除黑名单
-                if any(j in url for j in JUNK_DOMAINS):
-                    continue
-                # 排除个人观点性质的内容（博客、论坛、问答、自媒体）
-                opinion_markers = ['博客', '论坛', '知乎', '百度知道', '个人', '我认为', '我觉得',
-                                   '网友', '楼主', '自媒体', '公众号', '头条号', '百家号']
-                if any(m in title or m in body for m in opinion_markers):
-                    continue
-                seen_urls.add(url)
-                results.append({'title': title, 'body': body[:500], 'url': url, 'trusted': True})
+                raw = list(DDGS().text(query, max_results=8))
+            return raw
+
+        # 并行执行搜索
+        all_raw = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {executor.submit(_do_query, q): q for q in queries}
+            for future in as_completed(futures, timeout=8):
+                try:
+                    all_raw.extend(future.result())
+                except Exception:
+                    pass
+
+        seen_urls = set()
+        opinion_markers = ['博客', '论坛', '知乎', '百度知道', '个人', '我认为', '我觉得',
+                           '网友', '楼主', '自媒体', '公众号', '头条号', '百家号']
+        for item in all_raw:
+            url = item.get('href', '') or item.get('url', '') or item.get('link', '')
+            title = (item.get('title', '') or '').strip()
+            body = (item.get('body', '') or item.get('snippet', '') or item.get('content', '') or '').strip()
+            if not title or not body:
+                continue
+            if url in seen_urls:
+                continue
+            if not any(d in url for d in TRUSTED_LEGAL_DOMAINS):
+                continue
+            if any(j in url for j in JUNK_DOMAINS):
+                continue
+            if any(m in title or m in body for m in opinion_markers):
+                continue
+            seen_urls.add(url)
+            results.append({'title': title, 'body': body[:500], 'url': url, 'trusted': True})
             if len(results) >= max_results:
                 break
         results = results[:max_results]
@@ -429,6 +442,8 @@ class LegalDocManager:
         self.chunks = []
         self.law_count = 0
         self.category_count = 0
+        self._inverted_index = defaultdict(list)  # keyword -> [(chunk_idx, count)]
+        self._index_ready = False
 
     def load_builtin_laws(self):
         """启动时加载全量法律数据"""
@@ -496,6 +511,23 @@ class LegalDocManager:
         self.chunks = []
         for filename, content in self.documents.items():
             self.chunks.extend(self._split_content(content, filename))
+        self._build_index()
+
+    def _build_index(self):
+        """构建倒排索引：keyword -> [(chunk_idx, count)]，搜索时直接查索引而非遍历全部"""
+        self._inverted_index = defaultdict(list)
+        for idx, chunk in enumerate(self.chunks):
+            combined = chunk['content'] + ' ' + chunk['title']
+            words = jieba.lcut(combined)
+            word_count = defaultdict(int)
+            for w in words:
+                w = w.strip()
+                if len(w) >= 2 and w not in self._STOP and not re.match(r'^[^\u4e00-\u9fff\w]+$', w):
+                    word_count[w] += 1
+            for w, cnt in word_count.items():
+                self._inverted_index[w].append((idx, cnt))
+        self._index_ready = True
+        print(f'[索引] 倒排索引构建完成: {len(self._inverted_index)} 个词条, 覆盖 {len(self.chunks)} 个段落')
 
     def _split_content(self, content, filename):
         chunks = []
@@ -580,32 +612,59 @@ class LegalDocManager:
         law_names = set()
         for m in re.finditer(r'《(.+?)》', question):
             law_names.add(m.group(1))
-        scored = []
-        for chunk in self.chunks:
-            score = 0.0
-            combined = chunk['content'] + ' ' + chunk['title']
+
+        # 使用倒排索引快速定位相关段落
+        if self._index_ready:
+            scores = defaultdict(float)
             for kw in kws:
-                cnt = combined.count(kw)
-                if cnt:
-                    score += cnt * (1.5 if len(kw) >= 3 else 1.0)
-            if chunk['is_article']:
-                cn = self._cn2int(chunk['article_num'])
-                if cn in asked_nums:
-                    score += 50
+                weight = 1.5 if len(kw) >= 3 else 1.0
+                postings = self._inverted_index.get(kw)
+                if postings:
+                    for idx, cnt in postings:
+                        scores[idx] += cnt * weight
+            # 条文号精确匹配加分
+            if asked_nums:
+                for idx in list(scores.keys()):
+                    chunk = self.chunks[idx]
+                    if chunk['is_article']:
+                        cn = self._cn2int(chunk['article_num'])
+                        if cn in asked_nums:
+                            scores[idx] += 50
+            # 法律名称匹配加分
             if law_names:
-                src = chunk['source']
-                for ln in law_names:
-                    if ln in src:
-                        score += 30
-            if score > 0:
-                scored.append((score, chunk))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in scored[:top_n]]
+                for idx in list(scores.keys()):
+                    src = self.chunks[idx]['source']
+                    for ln in law_names:
+                        if ln in src:
+                            scores[idx] += 30
+                            break
+            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            return [self.chunks[idx] for idx, _ in ranked[:top_n]]
+        else:
+            # 索引未就绪时的回退方案
+            scored = []
+            for chunk in self.chunks:
+                score = 0.0
+                combined = chunk['content'] + ' ' + chunk['title']
+                for kw in kws:
+                    cnt = combined.count(kw)
+                    if cnt:
+                        score += cnt * (1.5 if len(kw) >= 3 else 1.0)
+                if score > 0:
+                    scored.append((score, chunk))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [c for _, c in scored[:top_n]]
 
     def search_only(self, question):
-        results = self.search(question, top_n=8)
-        # 同时从官方渠道联网检索更多法律条文、地方法规、司法解释
-        web_results = official_web_search(question, max_results=5)
+        # 本地搜索和联网搜索并行执行，联网搜索最多等4秒
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            local_future = executor.submit(self.search, question, 8)
+            web_future = executor.submit(official_web_search, question, 5)
+            results = local_future.result()
+            try:
+                web_results = web_future.result(timeout=4)
+            except Exception:
+                web_results = []
         if not self.chunks and not web_results:
             return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
         if not results and not web_results:
@@ -637,11 +696,15 @@ class LegalDocManager:
         return {'answer': '\n\n'.join(display_parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
     def search_cases_only(self, question):
-        local_results = self.search(question, top_n=6)
+        # 并行执行本地搜索和联网案例搜索
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            local_future = executor.submit(self.search, question, 6)
+            web_future = executor.submit(case_search, question)
+            local_results = local_future.result()
+            web_cases = web_future.result()
         case_results = [c for c in local_results if '案例' in c['source']]
         other_results = [c for c in local_results if '案例' not in c['source']]
         local_case = (case_results + other_results)[:5]
-        web_cases = case_search(question)
         if not local_case and not web_cases:
             return {'answer': '未找到相关典型案例。建议换一种方式提问，或前往人民法院案例库（rmfyalk.court.gov.cn）检索。',
                     'citations': [], 'web_citations': [], 'ai_used': False}
@@ -662,9 +725,14 @@ class LegalDocManager:
         return {'answer': '\n\n'.join(parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
     def answer_with_ai(self, question, history=None, use_web=False, use_case=False):
-        results = self.search(question)
-        web_results = web_search(question) if use_web else []
-        case_results = case_search(question) if use_case else []
+        # 并行执行本地搜索、联网搜索、案例搜索
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            local_future = executor.submit(self.search, question)
+            web_future = executor.submit(web_search, question) if use_web else None
+            case_future = executor.submit(case_search, question) if use_case else None
+            results = local_future.result()
+            web_results = web_future.result() if web_future else []
+            case_results = case_future.result() if case_future else []
 
         if not self.chunks and not web_results and not case_results:
             return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
@@ -961,6 +1029,7 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:linear-gr
 .login-footer{text-align:center;margin-top:14px;font-size:12px;color:#a0aec0}
 .loading{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-radius:50%;border-top-color:#fff;animation:spin .7s linear infinite;vertical-align:middle;margin-right:5px}
 @keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:420px){.login-card{padding:32px 22px}.login-header .icon{font-size:40px}.login-header h1{font-size:19px}}
 </style>
 </head>
 <body>
@@ -990,7 +1059,7 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:linear-gr
   </form>
   <div id="msg" class="msg"></div>
   <div class="register-link">还没有账户？<a href="/register">注册一个</a></div>
-  <div class="login-footer">法律问答助手 v5.1 · 安全加密存储</div>
+  <div class="login-footer">法律问答助手 v5.2 · 安全加密存储</div>
 </div>
 <script>
 document.getElementById('username').onkeydown=function(e){if(e.key==='Enter')document.getElementById('password').focus()};
@@ -1054,6 +1123,7 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:linear-gr
 .register-link a:hover{text-decoration:underline}
 .loading{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-radius:50%;border-top-color:#fff;animation:spin .7s linear infinite;vertical-align:middle;margin-right:5px}
 @keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:420px){.login-card{padding:32px 22px}.login-header .icon{font-size:40px}.login-header h1{font-size:19px}}
 </style>
 </head>
 <body>
@@ -1131,7 +1201,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>法律问答助手 - 全量法律库 AI 版</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
@@ -1229,22 +1299,72 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   ::-webkit-scrollbar{width:6px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:#cbd5e0;border-radius:3px}
-  @media(max-width:768px){.sidebar{width:100%;max-height:35vh;border-right:none;border-bottom:1px solid #e2e8f0}.main{flex-direction:column}.messages{padding:16px}.input-area{padding:12px 16px}.msg-bubble{max-width:88%}.header .sub{display:none}}
+  /* ===== 移动端组件基础样式（桌面隐藏） ===== */
+  .menu-btn{display:none;align-items:center;justify-content:center;width:38px;height:38px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;border-radius:8px;font-size:18px;cursor:pointer;flex-shrink:0;line-height:1}
+  .backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:90;opacity:0;transition:opacity .25s}
+  .backdrop.show{display:block;opacity:1}
+  .sidebar-close{display:none;position:absolute;top:12px;right:12px;z-index:5;align-items:center;justify-content:center;width:32px;height:32px;background:#f7fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:15px;color:#4a5568;cursor:pointer;line-height:1}
+  /* ===== 移动端响应式（≤768px） ===== */
+  @media(max-width:768px){
+    .menu-btn{display:flex}
+    .header{padding:10px 14px;gap:8px}
+    .header .icon{font-size:22px}
+    .header h1{font-size:17px;letter-spacing:1px}
+    .header .sub,.header .badge{display:none}
+    .header .user-box{margin-left:auto;gap:6px}
+    .header .user-phone{font-size:12px}
+    .header .btn-out{padding:3px 10px;font-size:11px}
+    .main{flex-direction:column}
+    /* 侧边栏变为抽屉 */
+    .sidebar{position:fixed;left:0;top:0;bottom:0;width:82%;max-width:320px;max-height:none;z-index:100;transform:translateX(-105%);transition:transform .28s ease;border-right:none;box-shadow:none;padding-top:4px}
+    .sidebar.open{transform:translateX(0);box-shadow:6px 0 24px rgba(0,0,0,.25)}
+    .sidebar-close{display:flex}
+    .sidebar-title{padding-right:52px}
+    .messages{padding:16px 12px}
+    .input-area{padding:8px 10px calc(10px + env(safe-area-inset-bottom));gap:8px}
+    .input-area > div{min-width:0}
+    .input-area textarea{font-size:16px;padding:8px 10px;max-height:80px}
+    .input-area .send-btn{padding:9px 12px;font-size:12px;flex-shrink:0}
+    .msg-bubble{max-width:90%;font-size:14px;padding:12px 14px}
+    .msg-avatar{width:30px;height:30px;font-size:14px}
+    .msg-row{margin-bottom:14px;gap:8px}
+    .welcome{margin-top:24px}
+    .welcome .wi{font-size:44px;margin-bottom:10px}
+    .welcome h2{font-size:17px}
+    .welcome p{font-size:13px;line-height:1.7}
+    .welcome .tips{gap:8px;margin-top:18px}
+    .welcome .tt{font-size:12px;padding:7px 12px}
+    /* 模式切换自动换行，说明文字独占一行始终可见 */
+    .mode-toggle{flex-wrap:wrap;overflow-x:visible;gap:5px;padding-bottom:2px;margin-bottom:6px}
+    .mode-toggle .mt-label{white-space:nowrap;flex-shrink:0;font-size:12px;padding:4px 9px}
+    .mode-toggle .mt-hint{flex-basis:100%;width:100%;font-size:11px;margin-left:0;margin-top:1px}
+    .doc-item .dn{font-size:12px}
+    .doc-item .dm{font-size:10px}
+    .history-item{font-size:12px;padding:6px 8px}
+    .history-item .ht{font-size:10px}
+    .citation-tag{font-size:10px;padding:3px 8px}
+    .citation-tags{gap:5px}
+    .stats-bar{font-size:11px}
+    .flk-link a{font-size:12px}
+  }
 </style>
 </head>
 <body>
 <div class="header">
+  <button class="menu-btn" onclick="toggleSidebar()" aria-label="打开菜单">&#9776;</button>
   <span class="icon">&#9878;</span>
   <h1>法律问答助手</h1>
   <span class="sub">DeepSeek AI · 4868部法律法规 + 司法解释 + 典型案例</span>
-  <span class="badge">全量法律库 v5.1</span>
+  <span class="badge">全量法律库 v5.2</span>
   <div class="user-box">
     <span class="user-phone">&#128100; {{ username }}</span>
     <button class="btn-out" onclick="logout()">退出</button>
   </div>
 </div>
+<div class="backdrop" id="backdrop" onclick="toggleSidebar()"></div>
 <div class="main">
-  <div class="sidebar">
+  <div class="sidebar" id="sidebar">
+    <button class="sidebar-close" onclick="toggleSidebar()" aria-label="关闭菜单">&#10005;</button>
     <div class="sidebar-title">&#128218; 法律知识库</div>
     <div class="stats-bar" id="statsBar">正在加载法律库统计…</div>
     {% if is_dev %}
@@ -1301,6 +1421,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 </div>
 <script>
 let busy=false,chatMode='ai',abortCtrl=null,chatHistory=[],useWeb=false,useCase=false;
+function toggleSidebar(){const sb=document.getElementById('sidebar'),bd=document.getElementById('backdrop');const open=sb.classList.toggle('open');bd.classList.toggle('show',open);document.body.style.overflow=open?'hidden':''}
 function toggleWeb(){useWeb=!useWeb;document.getElementById('modeWeb').className=useWeb?'mt-label active-web':'mt-label'}
 function toggleCase(){useCase=!useCase;document.getElementById('modeCase').className=useCase?'mt-label active-case':'mt-label'}
 function setMode(m){chatMode=m;const ai=document.getElementById('modeAi'),se=document.getElementById('modeSearch'),hint=document.getElementById('modeHint');ai.className='mt-label';se.className='mt-label';if(m==='ai'){ai.className='mt-label active';hint.textContent='AI回答更精准，消耗tokens'}else{se.className='mt-label active-search';hint.textContent='直接搜索法律库，免费不消耗tokens'}}
@@ -1324,7 +1445,7 @@ function rdl(docs){const el=document.getElementById('docList');const uploads=doc
 async function loadHistory(){try{const r=await fetch('/api/history');if(!r.ok)return;const d=await r.json();const el=document.getElementById('historyList');if(!d.history||!d.history.length){el.innerHTML='<div class="history-empty">暂无搜索记录</div>';return}el.innerHTML=d.history.map(h=>{const t=h.t?h.t.slice(5,16):'';return `<div class="history-item"><span class="hq" onclick="fill('${esc(h.q).replace(/'/g,"\\'")}')">${esc(h.q)}</span><span class="ht">${t}</span><button class="hd" onclick="delHistory(${h.id})" title="删除">&#10005;</button></div>`}).join('')}catch{}}
 async function delHistory(id){try{await fetch('/api/history/'+id,{method:'DELETE'});loadHistory()}catch{}}
 async function dd(n){if(!confirm('确定删除吗？'))return;try{await fetch('/api/documents/'+encodeURIComponent(n),{method:'DELETE'});loadDocs()}catch{alert('删除失败')}}
-function fill(t){document.getElementById('qInput').value=t;document.getElementById('qInput').focus()}
+function fill(t){document.getElementById('qInput').value=t;document.getElementById('qInput').focus();const sb=document.getElementById('sidebar');if(sb&&sb.classList.contains('open'))toggleSidebar()}
 function hk(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}}
 function ar(){const t=document.getElementById('qInput');t.addEventListener('input',()=>{t.style.height='auto';t.style.height=Math.min(t.scrollHeight,120)+'px'})}
 async function send(){

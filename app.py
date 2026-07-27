@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════╗
-║   法律问答助手 v5.2 — 全量法律库 + AI + 案例搜索     ║
+║   法律问答助手 v5.3 — 全量法律库 + AI + 案例搜索     ║
 ║                                                      ║
 ║  内置法律库：4868部法律法规 + 司法解释 + 典型案例     ║
 ║  AI 引擎：  DeepSeek 大模型智能回答                   ║
 ║  特色功能：联网搜索 · 两高典型案例检索                ║
 ║  用户系统：用户名密码登录 · 注册 · 记住我             ║
-║  性能优化：倒排索引 · 并行搜索 · 预加载分词           ║
-║  部署平台：PythonAnywhere                             ║
+║  性能优化：倒排索引 · 并行搜索 · 联网熔断器           ║
+║  部署平台：腾讯云轻量服务器 + PythonAnywhere          ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -17,8 +17,10 @@ import re
 import json
 import gzip
 import glob
+import time
 import sqlite3
 import secrets
+import threading
 from datetime import datetime, timedelta
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,6 +50,39 @@ except ImportError:
         WEB_SEARCH_AVAILABLE = True
     except ImportError:
         WEB_SEARCH_AVAILABLE = False
+
+# ---- 联网搜索熔断器 ----
+# 部分服务器（如国内机房）无法访问DuckDuckGo，请求会一直卡住。
+# 连续失败2次后暂停联网搜索10分钟，期间直接返回空结果，保证搜索秒开。
+_web_lock = threading.Lock()
+_web_fail_streak = 0
+_web_disabled_until = 0.0
+
+
+def _web_allowed():
+    """联网搜索是否可用（已安装且未被熔断）"""
+    return WEB_SEARCH_AVAILABLE and time.time() >= _web_disabled_until
+
+
+def _web_report(ok):
+    """汇报一次联网搜索成功/失败，连续失败2次则熔断10分钟"""
+    global _web_fail_streak, _web_disabled_until
+    with _web_lock:
+        if ok:
+            _web_fail_streak = 0
+        else:
+            _web_fail_streak += 1
+            if _web_fail_streak >= 2:
+                _web_disabled_until = time.time() + 600
+                print(f'[联网搜索] 连续失败{_web_fail_streak}次，暂停联网搜索10分钟')
+
+
+def _ddgs_client():
+    """创建带6秒硬超时的DDGS客户端（旧版本不支持timeout参数时自动降级）"""
+    try:
+        return DDGS(timeout=6)
+    except TypeError:
+        return DDGS()
 
 # ==================== 配置 ====================
 app = Flask(__name__)
@@ -311,15 +346,15 @@ def api_user_info():
 
 def web_search(question, max_results=6):
     """联网搜索法律信息，经过域名白名单和相关性筛选，过滤杂乱信息"""
-    if not WEB_SEARCH_AVAILABLE:
+    if not _web_allowed():
         return []
     results = []
     try:
         query = f'{question} 法律 法规 司法解释'
         try:
-            raw = list(DDGS().text(query, region='cn-zh', max_results=15))
+            raw = list(_ddgs_client().text(query, region='cn-zh', max_results=15))
         except TypeError:
-            raw = list(DDGS().text(query, max_results=15))
+            raw = list(_ddgs_client().text(query, max_results=15))
         for item in raw:
             url = item.get('href', '') or item.get('url', '') or item.get('link', '')
             title = (item.get('title', '') or '').strip()
@@ -347,7 +382,7 @@ def web_search(question, max_results=6):
 
 def official_web_search(question, max_results=6):
     """严格官方搜索：仅接受政府/官方来源，排除一切私人网站和个人观点（并行加速）"""
-    if not WEB_SEARCH_AVAILABLE:
+    if not _web_allowed():
         return []
     results = []
     try:
@@ -358,20 +393,23 @@ def official_web_search(question, max_results=6):
 
         def _do_query(query):
             try:
-                raw = list(DDGS().text(query, region='cn-zh', max_results=8))
+                raw = list(_ddgs_client().text(query, region='cn-zh', max_results=8))
             except TypeError:
-                raw = list(DDGS().text(query, max_results=8))
+                raw = list(_ddgs_client().text(query, max_results=8))
             return raw
 
-        # 并行执行搜索
+        # 并行执行搜索（不等待卡死的线程，最多等8秒）
         all_raw = []
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        executor = ThreadPoolExecutor(max_workers=2)
+        try:
             futures = {executor.submit(_do_query, q): q for q in queries}
             for future in as_completed(futures, timeout=8):
                 try:
                     all_raw.extend(future.result())
                 except Exception:
                     pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         seen_urls = set()
         opinion_markers = ['博客', '论坛', '知乎', '百度知道', '个人', '我认为', '我觉得',
@@ -403,15 +441,15 @@ def official_web_search(question, max_results=6):
 
 def case_search(question, max_results=8):
     """专门搜索两高典型案例，优先从官方案例库和权威来源获取"""
-    if not WEB_SEARCH_AVAILABLE:
+    if not _web_allowed():
         return []
     results = []
     try:
         query = f'{question} 典型案例 最高人民法院 最高人民检察院'
         try:
-            raw = list(DDGS().text(query, region='cn-zh', max_results=20))
+            raw = list(_ddgs_client().text(query, region='cn-zh', max_results=20))
         except TypeError:
-            raw = list(DDGS().text(query, max_results=20))
+            raw = list(_ddgs_client().text(query, max_results=20))
         case_domains = ['court.gov.cn', 'spp.gov.cn', 'rmfyalk.court.gov.cn', 'wenshu.court.gov.cn', 'pkulaw.com', 'chinalawinfo.com']
         case_kws = ['典型案例', '指导性案例', '案例', '判决', '裁定', '公诉', '审判']
         for item in raw:
@@ -657,14 +695,20 @@ class LegalDocManager:
 
     def search_only(self, question):
         # 本地搜索和联网搜索并行执行，联网搜索最多等4秒
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        # 用 shutdown(wait=False) 确保不被卡死的联网线程拖住响应
+        executor = ThreadPoolExecutor(max_workers=2)
+        try:
             local_future = executor.submit(self.search, question, 8)
             web_future = executor.submit(official_web_search, question, 5)
             results = local_future.result()
             try:
                 web_results = web_future.result(timeout=4)
+                _web_report(True)
             except Exception:
                 web_results = []
+                _web_report(False)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         if not self.chunks and not web_results:
             return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
         if not results and not web_results:
@@ -696,12 +740,20 @@ class LegalDocManager:
         return {'answer': '\n\n'.join(display_parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
     def search_cases_only(self, question):
-        # 并行执行本地搜索和联网案例搜索
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        # 并行执行本地搜索和联网案例搜索（联网最多等4秒，不等待卡死的线程）
+        executor = ThreadPoolExecutor(max_workers=2)
+        try:
             local_future = executor.submit(self.search, question, 6)
             web_future = executor.submit(case_search, question)
             local_results = local_future.result()
-            web_cases = web_future.result()
+            try:
+                web_cases = web_future.result(timeout=4)
+                _web_report(True)
+            except Exception:
+                web_cases = []
+                _web_report(False)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         case_results = [c for c in local_results if '案例' in c['source']]
         other_results = [c for c in local_results if '案例' not in c['source']]
         local_case = (case_results + other_results)[:5]
@@ -725,14 +777,29 @@ class LegalDocManager:
         return {'answer': '\n\n'.join(parts), 'citations': citations, 'web_citations': web_citations, 'ai_used': False}
 
     def answer_with_ai(self, question, history=None, use_web=False, use_case=False):
-        # 并行执行本地搜索、联网搜索、案例搜索
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        # 并行执行本地搜索、联网搜索、案例搜索（联网最多各等4秒，不等待卡死的线程）
+        executor = ThreadPoolExecutor(max_workers=3)
+        try:
             local_future = executor.submit(self.search, question)
             web_future = executor.submit(web_search, question) if use_web else None
             case_future = executor.submit(case_search, question) if use_case else None
             results = local_future.result()
-            web_results = web_future.result() if web_future else []
-            case_results = case_future.result() if case_future else []
+            web_results = []
+            if web_future:
+                try:
+                    web_results = web_future.result(timeout=4)
+                    _web_report(True)
+                except Exception:
+                    _web_report(False)
+            case_results = []
+            if case_future:
+                try:
+                    case_results = case_future.result(timeout=4)
+                    _web_report(True)
+                except Exception:
+                    _web_report(False)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         if not self.chunks and not web_results and not case_results:
             return {'answer': '法律库为空，请上传法律文件。', 'citations': [], 'ai_used': False}
@@ -1059,7 +1126,7 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:linear-gr
   </form>
   <div id="msg" class="msg"></div>
   <div class="register-link">还没有账户？<a href="/register">注册一个</a></div>
-  <div class="login-footer">法律问答助手 v5.2 · 安全加密存储</div>
+  <div class="login-footer">法律问答助手 v5.3 · 安全加密存储</div>
 </div>
 <script>
 document.getElementById('username').onkeydown=function(e){if(e.key==='Enter')document.getElementById('password').focus()};
@@ -1355,7 +1422,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   <span class="icon">&#9878;</span>
   <h1>法律问答助手</h1>
   <span class="sub">DeepSeek AI · 4868部法律法规 + 司法解释 + 典型案例</span>
-  <span class="badge">全量法律库 v5.2</span>
+  <span class="badge">全量法律库 v5.3</span>
   <div class="user-box">
     <span class="user-phone">&#128100; {{ username }}</span>
     <button class="btn-out" onclick="logout()">退出</button>
